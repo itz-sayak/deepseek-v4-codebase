@@ -42,23 +42,21 @@ correctness tests (numerically validated; 31 tests pass, 0 skipped).
 | 8192         | ~1651         | ~14          | 6 140 MiB |
 | 16384        | 1449          | 11.9         | 9 335 MiB |
 
-### Measured throughput (GPU / bf16 / batch=1 / 2B model, 2× RTX 4090, fast_prefill + swa_offload + 2-GPU shard)
+### Measured throughput (GPU / bf16 / batch=1 / 2B model, 2× RTX 4090, fast_prefill / chunked_fast_prefill + 2-GPU shard)
 
 | source_tokens | prefill tok/s | decode tok/s | peak HBM (GPU 0) |
 |--------------|---------------|--------------|-----------------|
 | 65 536       | 1407          | 12.3         | 7 418 MiB       |
 | 131 072      | 1406          | 11.9         | 12 853 MiB      |
+| 262 144      | 1137.5        | n/a          | 16 933 MiB      |
 
 Raw JSON results in `artifacts/benchmark_gpu_2b.json` and
 `artifacts/benchmark_gpu_2b_longctx.json`.
 
 Latest long-context validation extends this same 2× RTX 4090 setup out to
-256K tokens; the older artifact snapshot above stops at 131K, but the current
-benchmark ceiling is now 256K on the chunked-prefill path.
-
-Verified in the `deepfill` conda env with a direct `chunked_fast_prefill`
-run at 262,144 tokens; the run completed successfully and peaked at 19.28 GB
-on GPU 0.
+256K tokens. The 262,144-token row above comes from a direct
+`chunked_fast_prefill(mhc_chunk_size=4096)` measurement on the 2-GPU sharded
+path; decode throughput was not measured in that run.
 
 ### Honest remaining gap for true 1M-token scale
 
