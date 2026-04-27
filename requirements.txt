@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+huggingface_hub
+sentencepiece
+pyarrow
+tqdm
+pytest
+ninja

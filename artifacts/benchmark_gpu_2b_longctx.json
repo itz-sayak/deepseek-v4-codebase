@@ -1,0 +1,42 @@
+[
+  {
+    "source_tokens": 65536,
+    "decode_tokens": 16,
+    "batch_size": 1,
+    "use_prefix_cache": false,
+    "backend": "cuda_extension",
+    "allocator_device_pages": 0,
+    "allocator_host_pages": 0,
+    "swa_mode": "periodic",
+    "fast_prefill": true,
+    "swa_offload": true,
+    "num_gpus": 2,
+    "bench_runs": 1,
+    "avg_prefill_s": 46.5775,
+    "avg_decode_s": 1.2996,
+    "prefill_tokens_per_s": 1407.0,
+    "decode_tokens_per_s": 12.3,
+    "ms_per_decode_token": 81.222,
+    "peak_hbm_mib": 7418.1
+  },
+  {
+    "source_tokens": 131072,
+    "decode_tokens": 16,
+    "batch_size": 1,
+    "use_prefix_cache": false,
+    "backend": "cuda_extension",
+    "allocator_device_pages": 0,
+    "allocator_host_pages": 0,
+    "swa_mode": "periodic",
+    "fast_prefill": true,
+    "swa_offload": true,
+    "num_gpus": 2,
+    "bench_runs": 1,
+    "avg_prefill_s": 93.2154,
+    "avg_decode_s": 1.343,
+    "prefill_tokens_per_s": 1406.1,
+    "decode_tokens_per_s": 11.9,
+    "ms_per_decode_token": 83.935,
+    "peak_hbm_mib": 12853.4
+  }
+]
