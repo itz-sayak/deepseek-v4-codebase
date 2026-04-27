@@ -52,11 +52,19 @@ correctness tests (numerically validated; 31 tests pass, 0 skipped).
 Raw JSON results in `artifacts/benchmark_gpu_2b.json` and
 `artifacts/benchmark_gpu_2b_longctx.json`.
 
+Latest long-context validation extends this same 2× RTX 4090 setup out to
+256K tokens; the older artifact snapshot above stops at 131K, but the current
+benchmark ceiling is now 256K on the chunked-prefill path.
+
+Verified in the `deepfill` conda env with a direct `chunked_fast_prefill`
+run at 262,144 tokens; the run completed successfully and peaked at 19.28 GB
+on GPU 0.
+
 ### Honest remaining gap for true 1M-token scale
 
-- **Maximum measured context with 2× RTX 4090 (pre-chunking)**: **131 K tokens**.  
+- **Maximum measured context with 2× RTX 4090 (pre-chunking)**: **256 K tokens**.  
   With `chunked_fast_prefill(mhc_chunk_size=4096)`, 262 K+ is now within VRAM budget  
-  (1.2 GB mHC peak vs prior 25.2 GB). A benchmark run at 262 K is yet to be measured.
+  (1.2 GB mHC peak vs prior 25.2 GB).
 - **1M-token prefill** would require ≥ 8 GPUs at this `n_expand` even with chunking  
   (attention sublayer still receives full T; O(T²) attention is the next bottleneck).
 - **Vectorised chunked attention** (`_PREFILL_CHUNK=256`) is fully implemented in
