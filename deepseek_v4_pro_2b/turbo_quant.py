@@ -99,24 +99,26 @@ class PolarQuant:
             raise ValueError(f"bits must be 4 or 8, got {bits}")
         self.bits = bits
         self._seed = seed
-        # Cache Rademacher diagonals by dimension.  Populated lazily on first
-        # encode/decode call for that dimension.
-        self._diag_cache: Dict[int, torch.Tensor] = {}
+        # Cache Rademacher diagonals by (dimension, device).  Populated lazily on
+        # first encode/decode call for that (d, device) pair so multi-GPU sharding
+        # never causes repeated .to(device) copies across calls.
+        self._diag_cache: Dict[Tuple[int, str], torch.Tensor] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _diag(self, d: int, device: torch.device) -> torch.Tensor:
-        """Return the fixed ±1 Rademacher diagonal for dimension *d*."""
-        if d not in self._diag_cache:
+        """Return the fixed ±1 Rademacher diagonal for dimension *d* on *device*."""
+        key = (d, str(device))
+        if key not in self._diag_cache:
             gen = torch.Generator()
             # Unique seed per dimension so D=64 and D=128 get different diagonals.
             gen.manual_seed(self._seed * 10007 + d)
             r = torch.rand(d, generator=gen)
-            diag = torch.where(r > 0.5, torch.ones(d), -torch.ones(d))
-            self._diag_cache[d] = diag
-        return self._diag_cache[d].to(device)
+            diag = torch.where(r > 0.5, torch.ones(d), -torch.ones(d)).to(device)
+            self._diag_cache[key] = diag
+        return self._diag_cache[key]
 
     # ------------------------------------------------------------------
     # Public API
