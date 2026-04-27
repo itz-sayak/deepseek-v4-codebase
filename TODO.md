@@ -48,7 +48,7 @@ correctness tests (numerically validated; 31 tests pass, 0 skipped).
 |--------------|---------------|--------------|-----------------|
 | 65 536       | 1407          | 12.3         | 7 418 MiB       |
 | 131 072      | 1406          | 11.9         | 12 853 MiB      |
-| 262 144      | 1137.5        | n/a          | 16 933 MiB      |
+| 262 144      | 1140.2        | 9.8          | 16 941 MiB      |
 
 Raw JSON results in `artifacts/benchmark_gpu_2b.json` and
 `artifacts/benchmark_gpu_2b_longctx.json`.
@@ -56,7 +56,8 @@ Raw JSON results in `artifacts/benchmark_gpu_2b.json` and
 Latest long-context validation extends this same 2× RTX 4090 setup out to
 256K tokens. The 262,144-token row above comes from a direct
 `chunked_fast_prefill(mhc_chunk_size=4096)` measurement on the 2-GPU sharded
-path; decode throughput was not measured in that run.
+path, followed by a direct `step_token` decode-rate measurement from the same
+prefilled state.
 
 ### Honest remaining gap for true 1M-token scale
 
