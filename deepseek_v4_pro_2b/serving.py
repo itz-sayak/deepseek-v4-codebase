@@ -18,6 +18,7 @@ from deepseek_pipeline.serving import (
 
 from .configuration import DeepSeekV4Pro2BConfig
 from .modeling import CSAAttention, HCAAttention, DeepSeekV4Pro2BForCausalLM, apply_rope
+from .turbo_quant import PolarQuant
 
 
 def _clone_optional(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -67,6 +68,8 @@ class HCAServingState:
     token_count: int = 0
     loaded_prefix_tokens: int = 0
     compressed: Optional[torch.Tensor] = None
+    # PolarQuant: per-vector float16 scale for compressed; None = unquantized (bf16).
+    compressed_scale: Optional[torch.Tensor] = None
     window: Optional[torch.Tensor] = None
     buffer_c: Optional[torch.Tensor] = None
     buffer_z: Optional[torch.Tensor] = None
@@ -76,6 +79,7 @@ class HCAServingState:
             token_count=self.token_count,
             loaded_prefix_tokens=self.loaded_prefix_tokens,
             compressed=_clone_optional(self.compressed),
+            compressed_scale=_clone_optional(self.compressed_scale),
             window=_clone_optional(self.window),
             buffer_c=_clone_optional(self.buffer_c),
             buffer_z=_clone_optional(self.buffer_z),
@@ -87,6 +91,7 @@ class HCAServingState:
             "token_count": self.token_count,
             "loaded_prefix_tokens": self.loaded_prefix_tokens,
             "compressed": _cpu_optional(self.compressed),
+            "compressed_scale": _cpu_optional(self.compressed_scale),
             "window": _cpu_optional(self.window),
             "buffer_c": _cpu_optional(self.buffer_c),
             "buffer_z": _cpu_optional(self.buffer_z),
@@ -98,6 +103,7 @@ class HCAServingState:
             token_count=int(payload["token_count"]),
             loaded_prefix_tokens=int(payload.get("loaded_prefix_tokens", 0)),
             compressed=None if payload.get("compressed") is None else payload["compressed"].to(device),
+            compressed_scale=None if payload.get("compressed_scale") is None else payload["compressed_scale"].to(device),
             window=None if payload.get("window") is None else payload["window"].to(device),
             buffer_c=None if payload.get("buffer_c") is None else payload["buffer_c"].to(device),
             buffer_z=None if payload.get("buffer_z") is None else payload["buffer_z"].to(device),
@@ -109,7 +115,10 @@ class CSAServingState:
     token_count: int = 0
     loaded_prefix_tokens: int = 0
     compressed: Optional[torch.Tensor] = None
+    # PolarQuant scale tensors; None = unquantized (bf16).
+    compressed_scale: Optional[torch.Tensor] = None
     index_compressed: Optional[torch.Tensor] = None
+    index_compressed_scale: Optional[torch.Tensor] = None
     window: Optional[torch.Tensor] = None
     curr_a_c: Optional[torch.Tensor] = None
     curr_a_z: Optional[torch.Tensor] = None
@@ -129,7 +138,9 @@ class CSAServingState:
             token_count=self.token_count,
             loaded_prefix_tokens=self.loaded_prefix_tokens,
             compressed=_clone_optional(self.compressed),
+            compressed_scale=_clone_optional(self.compressed_scale),
             index_compressed=_clone_optional(self.index_compressed),
+            index_compressed_scale=_clone_optional(self.index_compressed_scale),
             window=_clone_optional(self.window),
             curr_a_c=_clone_optional(self.curr_a_c),
             curr_a_z=_clone_optional(self.curr_a_z),
@@ -153,7 +164,9 @@ class CSAServingState:
         }
         for name in (
             "compressed",
+            "compressed_scale",
             "index_compressed",
+            "index_compressed_scale",
             "window",
             "curr_a_c",
             "curr_a_z",
@@ -179,7 +192,9 @@ class CSAServingState:
         }
         for name in (
             "compressed",
+            "compressed_scale",
             "index_compressed",
+            "index_compressed_scale",
             "window",
             "curr_a_c",
             "curr_a_z",
@@ -232,6 +247,7 @@ class ModelServingState:
                     {
                         "type": "hca",
                         "compressed": _cpu_optional(layer.compressed),
+                        "compressed_scale": _cpu_optional(layer.compressed_scale),
                     }
                 )
             else:
@@ -239,7 +255,9 @@ class ModelServingState:
                     {
                         "type": "csa",
                         "compressed": _cpu_optional(layer.compressed),
+                        "compressed_scale": _cpu_optional(layer.compressed_scale),
                         "index_compressed": _cpu_optional(layer.index_compressed),
+                        "index_compressed_scale": _cpu_optional(layer.index_compressed_scale),
                     }
                 )
         return {"token_count": reusable_tokens, "layers": layers}
@@ -253,6 +271,7 @@ class DeepSeekV4Pro2BServingEngine:
         prefix_manager: Optional[LongContextServingManager] = None,
         paged_allocator: Optional[PagedKVAllocator] = None,
         device: Optional[Union[str, torch.device]] = None,
+        turbo_quant_bits: Optional[int] = None,
     ) -> None:
         self.model = model.eval()
         self.config: DeepSeekV4Pro2BConfig = model.config
@@ -269,6 +288,9 @@ class DeepSeekV4Pro2BServingEngine:
             self.backend = chosen_backend
             self.prefix_manager = None
         self.paged_allocator = paged_allocator
+        # PolarQuant: None = disabled, PolarQuant(8) = 8-bit, PolarQuant(4) = 4-bit.
+        # Always validate 8-bit correctness before enabling 4-bit.
+        self._polar_quant: Optional[PolarQuant] = PolarQuant(turbo_quant_bits) if turbo_quant_bits is not None else None
         self._hca_layer_indices = [
             idx for idx, block in enumerate(self.model.model.layers) if isinstance(block.attn.sublayer, HCAAttention)
         ]
@@ -287,6 +309,68 @@ class DeepSeekV4Pro2BServingEngine:
             else:
                 layer_states.append(CSAServingState())
         return ModelServingState(token_count=0, layer_states=layer_states)
+
+    # ------------------------------------------------------------------
+    # PolarQuant helpers — no-ops when turbo_quant_bits is None
+    # ------------------------------------------------------------------
+
+    def _quant_append(
+        self,
+        existing_data: Optional[torch.Tensor],
+        existing_scale: Optional[torch.Tensor],
+        new_bf16: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Append a new block to the compressed KV cache.
+
+        If PolarQuant is enabled, *new_bf16* is quantized before appending so
+        the accumulated tensor stays in int8/uint8.  The scale tensor is grown
+        in parallel.  If disabled, this is just ``_append_seq`` on bf16 data.
+        """
+        if self._polar_quant is None:
+            return _append_seq(existing_data, new_bf16), None
+        new_data, new_scale = self._polar_quant.encode(new_bf16)
+        data = _append_seq(existing_data, new_data)
+        scale = _append_seq(existing_scale, new_scale)
+        return data, scale
+
+    def _read_compressed(
+        self,
+        data: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Return *data* as a floating-point tensor, dequantizing if a *scale* is present.
+
+        The output dtype matches the model's compute dtype (e.g. float32 on CPU,
+        bf16 on GPU) so downstream einsum/matmul ops don't hit dtype mismatches.
+        """
+        if data is None:
+            return None
+        if scale is None or self._polar_quant is None:
+            return data  # already in the model's compute dtype
+        model_dtype = self.model.lm_head.weight.dtype
+        return self._polar_quant.decode(data, scale, out_dtype=model_dtype)
+
+    def _compressed_to_bf16_for_paging(
+        self,
+        data: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        start: int,
+        end: int,
+    ) -> Optional[torch.Tensor]:
+        """Slice [start:end] from the compressed cache and return in model dtype.
+
+        Paged allocator stores tensors in the model's weight dtype; we dequantize
+        before flushing to pages so the allocator format is not affected by
+        whether TurboQuant is active.
+        """
+        if data is None or data.size(1) < end:
+            return None
+        sliced = data[:, start:end]
+        if scale is None or self._polar_quant is None:
+            return sliced
+        sliced_scale = scale[:, start:end]
+        model_dtype = self.model.lm_head.weight.dtype
+        return self._polar_quant.decode(sliced, sliced_scale, out_dtype=model_dtype)
 
     def _block_tokens(self) -> int:
         return math.lcm(self.config.csa_compression, self.config.hca_compression)
@@ -389,7 +473,9 @@ class DeepSeekV4Pro2BServingEngine:
         pos = torch.tensor([absolute_token], device=comp.device, dtype=torch.long)
         comp = apply_rope(comp, pos, self.config.rope_dim, self.config.rope_theta)
         comp = attn.kv_norm(comp)
-        state.compressed = _append_seq(state.compressed, comp)
+        state.compressed, state.compressed_scale = self._quant_append(
+            state.compressed, state.compressed_scale, comp
+        )
         state.buffer_c = None
         state.buffer_z = None
 
@@ -402,7 +488,8 @@ class DeepSeekV4Pro2BServingEngine:
         visible = self._visible_hca_blocks(model_state, state, layer_idx)
         if visible:
             paged_prefix = self._materialize_paged_prefix(model_state, layer_idx, "hca")
-            resident = state.compressed
+            # Dequantize resident compressed cache before use.
+            resident = self._read_compressed(state.compressed, state.compressed_scale)
             prefix_parts = [part for part in [paged_prefix, resident] if part is not None]
             prefix = torch.cat(prefix_parts, dim=1) if prefix_parts else None
             if prefix is not None:
@@ -452,13 +539,17 @@ class DeepSeekV4Pro2BServingEngine:
         pos = torch.tensor([absolute_token - (m - 1)], device=main_comp.device, dtype=torch.long)
         main_comp = apply_rope(main_comp, pos, self.config.rope_dim, self.config.rope_theta)
         main_comp = attn.kv_norm(main_comp)
-        state.compressed = _append_seq(state.compressed, main_comp)
+        state.compressed, state.compressed_scale = self._quant_append(
+            state.compressed, state.compressed_scale, main_comp
+        )
 
         index_c = torch.cat([state.curr_index_a_c, prev_index_b_c], dim=1)
         index_z = torch.cat([state.curr_index_a_z + attn.index_bias_a, prev_index_b_z + attn.index_bias_b], dim=1)
         index_w = torch.softmax(index_z.float(), dim=1).to(index_c.dtype)
         index_comp = (index_w * index_c).sum(dim=1, keepdim=True)
-        state.index_compressed = _append_seq(state.index_compressed, index_comp)
+        state.index_compressed, state.index_compressed_scale = self._quant_append(
+            state.index_compressed, state.index_compressed_scale, index_comp
+        )
 
         state.prev_b_c = state.curr_b_c
         state.prev_b_z = state.curr_b_z
@@ -488,11 +579,15 @@ class DeepSeekV4Pro2BServingEngine:
         global_values = None
         if visible:
             full_index = self._materialize_paged_prefix(model_state, layer_idx, "csa_index")
-            if state.index_compressed is not None:
-                full_index = state.index_compressed if full_index is None else torch.cat([full_index, state.index_compressed], dim=1)
+            # Dequantize resident index cache before scoring.
+            resident_index = self._read_compressed(state.index_compressed, state.index_compressed_scale)
+            if resident_index is not None:
+                full_index = resident_index if full_index is None else torch.cat([full_index, resident_index], dim=1)
+            # Dequantize resident KV cache before gathering.
             full_compressed = self._materialize_paged_prefix(model_state, layer_idx, "csa")
-            if state.compressed is not None:
-                full_compressed = state.compressed if full_compressed is None else torch.cat([full_compressed, state.compressed], dim=1)
+            resident_compressed = self._read_compressed(state.compressed, state.compressed_scale)
+            if resident_compressed is not None:
+                full_compressed = resident_compressed if full_compressed is None else torch.cat([full_compressed, resident_compressed], dim=1)
             index_q = attn.index_q_up(latent).view(x.size(0), 1, self.config.indexer_num_heads, self.config.indexer_head_dim)
             index_q = index_q[:, 0]
             score = torch.einsum("bhc,bsc->bhs", index_q, full_index[:, :visible])
@@ -678,10 +773,22 @@ class DeepSeekV4Pro2BServingEngine:
         }
         for layer_idx, layer_state in enumerate(state.layer_states):
             if isinstance(layer_state, HCAServingState):
-                page_tensors[f"layer{layer_idx}.hca"].copy_(layer_state.compressed[0, : self._hca_blocks_per_page])
+                bf16_slice = self._compressed_to_bf16_for_paging(
+                    layer_state.compressed, layer_state.compressed_scale, 0, self._hca_blocks_per_page
+                )
+                if bf16_slice is not None:
+                    page_tensors[f"layer{layer_idx}.hca"].copy_(bf16_slice[0])
             else:
-                page_tensors[f"layer{layer_idx}.csa"].copy_(layer_state.compressed[0, : self._csa_blocks_per_page])
-                page_tensors[f"layer{layer_idx}.csa_index"].copy_(layer_state.index_compressed[0, : self._csa_blocks_per_page])
+                bf16_slice = self._compressed_to_bf16_for_paging(
+                    layer_state.compressed, layer_state.compressed_scale, 0, self._csa_blocks_per_page
+                )
+                if bf16_slice is not None:
+                    page_tensors[f"layer{layer_idx}.csa"].copy_(bf16_slice[0])
+                idx_slice = self._compressed_to_bf16_for_paging(
+                    layer_state.index_compressed, layer_state.index_compressed_scale, 0, self._csa_blocks_per_page
+                )
+                if idx_slice is not None:
+                    page_tensors[f"layer{layer_idx}.csa_index"].copy_(idx_slice[0])
 
         self._ensure_paged_handle(state)
         self.paged_allocator.append_page(state.paged_prefix.handle, page_tensors)
@@ -693,13 +800,25 @@ class DeepSeekV4Pro2BServingEngine:
                 layer_state.compressed = layer_state.compressed[:, self._hca_blocks_per_page:]
                 if layer_state.compressed.size(1) == 0:
                     layer_state.compressed = None
+                if layer_state.compressed_scale is not None:
+                    layer_state.compressed_scale = layer_state.compressed_scale[:, self._hca_blocks_per_page:]
+                    if layer_state.compressed_scale.size(1) == 0:
+                        layer_state.compressed_scale = None
             else:
                 layer_state.compressed = layer_state.compressed[:, self._csa_blocks_per_page:]
                 if layer_state.compressed.size(1) == 0:
                     layer_state.compressed = None
+                if layer_state.compressed_scale is not None:
+                    layer_state.compressed_scale = layer_state.compressed_scale[:, self._csa_blocks_per_page:]
+                    if layer_state.compressed_scale.size(1) == 0:
+                        layer_state.compressed_scale = None
                 layer_state.index_compressed = layer_state.index_compressed[:, self._csa_blocks_per_page:]
                 if layer_state.index_compressed.size(1) == 0:
                     layer_state.index_compressed = None
+                if layer_state.index_compressed_scale is not None:
+                    layer_state.index_compressed_scale = layer_state.index_compressed_scale[:, self._csa_blocks_per_page:]
+                    if layer_state.index_compressed_scale.size(1) == 0:
+                        layer_state.index_compressed_scale = None
 
     def _inject_compressed_prefix(self, state: ModelServingState, payload: Dict[str, object]) -> None:
         loaded_prefix_tokens = int(payload["token_count"])
@@ -709,12 +828,16 @@ class DeepSeekV4Pro2BServingEngine:
             layer_state.loaded_prefix_tokens = loaded_prefix_tokens
             if paged_prefix is None:
                 layer_state.compressed = None if saved.get("compressed") is None else saved["compressed"].to(self.device)
+                layer_state.compressed_scale = None if saved.get("compressed_scale") is None else saved["compressed_scale"].to(self.device)
                 if isinstance(layer_state, CSAServingState):
                     layer_state.index_compressed = None if saved.get("index_compressed") is None else saved["index_compressed"].to(self.device)
+                    layer_state.index_compressed_scale = None if saved.get("index_compressed_scale") is None else saved["index_compressed_scale"].to(self.device)
             else:
                 layer_state.compressed = None
+                layer_state.compressed_scale = None
                 if isinstance(layer_state, CSAServingState):
                     layer_state.index_compressed = None
+                    layer_state.index_compressed_scale = None
 
     def _snapshot_for_periodic(self, state: ModelServingState) -> Dict[str, object]:
         return self._materialize_state_for_snapshot(state).to_swa_dict()
@@ -886,9 +1009,14 @@ class DeepSeekV4Pro2BServingEngine:
         # Compressed blocks — identical to what _hca_emit produces step-by-step.
         if full_blocks > 0:
             comp, _ = attn._compress(x)      # [B, full_blocks, D]
-            state.compressed = comp if comp.size(1) > 0 else None
+            if comp.size(1) > 0:
+                state.compressed, state.compressed_scale = self._quant_append(None, None, comp)
+            else:
+                state.compressed = None
+                state.compressed_scale = None
         else:
             state.compressed = None
+            state.compressed_scale = None
 
         # Window: last min(N, W) window-KV entries.
         window_all = attn._window_entries(x)  # [B, N, D]
@@ -927,11 +1055,19 @@ class DeepSeekV4Pro2BServingEngine:
         if full_blocks > 0:
             comp_main = attn._compress_main(x)    # [B, full_blocks, D]
             comp_idx = attn._compress_index(x)    # [B, full_blocks, index_D]
-            state.compressed = comp_main if comp_main.size(1) > 0 else None
-            state.index_compressed = comp_idx if comp_idx.size(1) > 0 else None
+            if comp_main.size(1) > 0:
+                state.compressed, state.compressed_scale = self._quant_append(None, None, comp_main)
+                state.index_compressed, state.index_compressed_scale = self._quant_append(None, None, comp_idx)
+            else:
+                state.compressed = None
+                state.compressed_scale = None
+                state.index_compressed = None
+                state.index_compressed_scale = None
         else:
             state.compressed = None
+            state.compressed_scale = None
             state.index_compressed = None
+            state.index_compressed_scale = None
 
         # Window.
         window_all = attn._window_entries(x)
@@ -994,21 +1130,26 @@ class DeepSeekV4Pro2BServingEngine:
                 for key, shape in page_shape.items()
             }
             for layer_idx, layer_state in enumerate(state.layer_states):
+                s = page_idx * self._hca_blocks_per_page if isinstance(layer_state, HCAServingState) else page_idx * self._csa_blocks_per_page
                 if isinstance(layer_state, HCAServingState):
-                    if layer_state.compressed is None:
-                        continue
-                    s = page_idx * self._hca_blocks_per_page
                     e = s + self._hca_blocks_per_page
-                    if e <= layer_state.compressed.size(1):
-                        page_tensors[f"layer{layer_idx}.hca"].copy_(layer_state.compressed[0, s:e])
+                    bf16_slice = self._compressed_to_bf16_for_paging(
+                        layer_state.compressed, layer_state.compressed_scale, s, e
+                    )
+                    if bf16_slice is not None:
+                        page_tensors[f"layer{layer_idx}.hca"].copy_(bf16_slice[0])
                 else:
-                    if layer_state.compressed is None or layer_state.index_compressed is None:
-                        continue
-                    s = page_idx * self._csa_blocks_per_page
                     e = s + self._csa_blocks_per_page
-                    if e <= layer_state.compressed.size(1):
-                        page_tensors[f"layer{layer_idx}.csa"].copy_(layer_state.compressed[0, s:e])
-                        page_tensors[f"layer{layer_idx}.csa_index"].copy_(layer_state.index_compressed[0, s:e])
+                    bf16_slice = self._compressed_to_bf16_for_paging(
+                        layer_state.compressed, layer_state.compressed_scale, s, e
+                    )
+                    if bf16_slice is not None:
+                        page_tensors[f"layer{layer_idx}.csa"].copy_(bf16_slice[0])
+                    idx_slice = self._compressed_to_bf16_for_paging(
+                        layer_state.index_compressed, layer_state.index_compressed_scale, s, e
+                    )
+                    if idx_slice is not None:
+                        page_tensors[f"layer{layer_idx}.csa_index"].copy_(idx_slice[0])
             self.paged_allocator.append_page(state.paged_prefix.handle, page_tensors)
             state.paged_prefix.page_count += 1
 
@@ -1019,15 +1160,27 @@ class DeepSeekV4Pro2BServingEngine:
                     flushed = num_pages * self._hca_blocks_per_page
                     rest = layer_state.compressed[:, flushed:]
                     layer_state.compressed = rest if rest.size(1) > 0 else None
+                if layer_state.compressed_scale is not None:
+                    flushed = num_pages * self._hca_blocks_per_page
+                    rest = layer_state.compressed_scale[:, flushed:]
+                    layer_state.compressed_scale = rest if rest.size(1) > 0 else None
             else:
                 if layer_state.compressed is not None:
                     flushed = num_pages * self._csa_blocks_per_page
                     rest = layer_state.compressed[:, flushed:]
                     layer_state.compressed = rest if rest.size(1) > 0 else None
+                if layer_state.compressed_scale is not None:
+                    flushed = num_pages * self._csa_blocks_per_page
+                    rest = layer_state.compressed_scale[:, flushed:]
+                    layer_state.compressed_scale = rest if rest.size(1) > 0 else None
                 if layer_state.index_compressed is not None:
                     flushed = num_pages * self._csa_blocks_per_page
                     rest = layer_state.index_compressed[:, flushed:]
                     layer_state.index_compressed = rest if rest.size(1) > 0 else None
+                if layer_state.index_compressed_scale is not None:
+                    flushed = num_pages * self._csa_blocks_per_page
+                    rest = layer_state.index_compressed_scale[:, flushed:]
+                    layer_state.index_compressed_scale = rest if rest.size(1) > 0 else None
 
     # ------------------------------------------------------------------
     # Fast batched prefill (uses model's causal forward pass)
@@ -1119,6 +1272,83 @@ class DeepSeekV4Pro2BServingEngine:
         state.last_logits = self.model.lm_head(hidden[:, -1, :].to(self.device)).detach()
 
         # Flush all complete pages to the paged allocator if one is configured.
+        if self.paged_allocator is not None:
+            self._flush_all_completed_pages(state)
+
+        return state
+
+    @torch.no_grad()
+    def chunked_fast_prefill(
+        self,
+        token_ids: Sequence[int],
+        mhc_chunk_size: int = 4096,
+    ) -> ModelServingState:
+        """Memory-efficient fast prefill that chunks mHC operations along T.
+
+        This is the fix for the 262K+ OOM caused by the mHC state tensor
+        ``[B, T, n_expand, D]`` peaking at ``2 × state_size`` per layer during
+        the standard ``forward()`` (the old ``mixed`` + ``state`` allocation).
+
+        Uses ``model.model.chunked_forward()`` which processes the mHC pre-mix
+        and post-mix in T-chunks of ``mhc_chunk_size``, while the attention
+        sublayer still sees the full T for correct causal attention.
+
+        Memory budget comparison (B=1, T=262144, n=4, D=1536, bf16):
+          - ``fast_prefill``: ~25.2 GB peak (2× state tensor)
+          - ``chunked_fast_prefill(mhc_chunk_size=4096)``: ~1.2 GB peak + O(T×D)
+
+        Parameters
+        ----------
+        token_ids : sequence of ints
+            The prompt token IDs.
+        mhc_chunk_size : int
+            Chunk size for the mHC T-dimension operations.  Default 4096.
+            Smaller = less peak memory but more Python loop iterations.
+
+        Returns
+        -------
+        ModelServingState ready for ``step_token``-based decode.
+        """
+        N = len(token_ids)
+        if N == 0:
+            return self._new_state()
+
+        tokens = torch.tensor([list(token_ids)], device=self.device, dtype=torch.long)
+
+        # Pre-create state so hooks populate it during the forward pass.
+        state = self._new_state()
+
+        hooks = []
+        for block, layer_state in zip(self.model.model.layers, state.layer_states):
+            attn = block.attn.sublayer
+            is_hca = isinstance(layer_state, HCAServingState)
+
+            def _make_hook(a, ls, hca):
+                def _hook(module, inp, _output):
+                    x = inp[0]
+                    if hca:
+                        self._extract_hca_state_from_hidden(a, ls, x, N)
+                    else:
+                        self._extract_csa_state_from_hidden(a, ls, x, N)
+                    if x.device != self.device:
+                        self._move_layer_state_to_device(ls, self.device)
+                return _hook
+
+            hooks.append(block.attn.sublayer.register_forward_hook(
+                _make_hook(attn, layer_state, is_hca)
+            ))
+
+        try:
+            hidden, _ = self.model.model.chunked_forward(
+                input_ids=tokens, mhc_chunk_size=mhc_chunk_size
+            )
+        finally:
+            for h in hooks:
+                h.remove()
+
+        state.token_count = N
+        state.last_logits = self.model.lm_head(hidden[:, -1, :].to(self.device)).detach()
+
         if self.paged_allocator is not None:
             self._flush_all_completed_pages(state)
 

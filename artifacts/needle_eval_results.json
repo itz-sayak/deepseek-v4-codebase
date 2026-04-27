@@ -1,0 +1,95 @@
+[
+  {
+    "ctx_length": 64,
+    "turbo_quant_bits": null,
+    "prefill_time_s": 0.4083,
+    "needle_position": 32,
+    "compressed_cosine_sim_mean": null,
+    "kl_div_vs_baseline": null,
+    "top1_match": null
+  },
+  {
+    "ctx_length": 64,
+    "turbo_quant_bits": 8,
+    "prefill_time_s": 0.4398,
+    "needle_position": 32,
+    "compressed_cosine_sim_mean": -0.03606,
+    "compressed_cosine_sim_min": -0.188609,
+    "kl_div_vs_baseline": 0.0,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.001602
+  },
+  {
+    "ctx_length": 64,
+    "turbo_quant_bits": 4,
+    "prefill_time_s": 0.4604,
+    "needle_position": 32,
+    "compressed_cosine_sim_mean": null,
+    "compressed_cosine_sim_min": null,
+    "kl_div_vs_baseline": 0.000515,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.096317
+  },
+  {
+    "ctx_length": 128,
+    "turbo_quant_bits": null,
+    "prefill_time_s": 0.6984,
+    "needle_position": 64,
+    "compressed_cosine_sim_mean": null,
+    "kl_div_vs_baseline": null,
+    "top1_match": null
+  },
+  {
+    "ctx_length": 128,
+    "turbo_quant_bits": 8,
+    "prefill_time_s": 0.7487,
+    "needle_position": 64,
+    "compressed_cosine_sim_mean": -0.009337,
+    "compressed_cosine_sim_min": -0.172637,
+    "kl_div_vs_baseline": 0.0,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.001577
+  },
+  {
+    "ctx_length": 128,
+    "turbo_quant_bits": 4,
+    "prefill_time_s": 0.7815,
+    "needle_position": 64,
+    "compressed_cosine_sim_mean": null,
+    "compressed_cosine_sim_min": null,
+    "kl_div_vs_baseline": 0.000228,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.067772
+  },
+  {
+    "ctx_length": 256,
+    "turbo_quant_bits": null,
+    "prefill_time_s": 1.3912,
+    "needle_position": 128,
+    "compressed_cosine_sim_mean": null,
+    "kl_div_vs_baseline": null,
+    "top1_match": null
+  },
+  {
+    "ctx_length": 256,
+    "turbo_quant_bits": 8,
+    "prefill_time_s": 1.505,
+    "needle_position": 128,
+    "compressed_cosine_sim_mean": 0.005598,
+    "compressed_cosine_sim_min": -0.094392,
+    "kl_div_vs_baseline": -0.0,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.00182
+  },
+  {
+    "ctx_length": 256,
+    "turbo_quant_bits": 4,
+    "prefill_time_s": 1.5838,
+    "needle_position": 128,
+    "compressed_cosine_sim_mean": null,
+    "compressed_cosine_sim_min": null,
+    "kl_div_vs_baseline": 0.000728,
+    "top1_match": true,
+    "logit_max_abs_diff": 0.114145
+  }
+]

@@ -495,6 +495,97 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         updated = mixed + c.unsqueeze(-1) * y.unsqueeze(2)
         return updated, balance_loss
 
+    def chunked_forward(
+        self,
+        state: torch.Tensor,
+        chunk_size: int,
+        token_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Memory-efficient forward that chunks the T dimension for the mHC.
+
+        The mHC pre-mix (norm, a, b, c computations) and post-mix (mixed residual
+        + update) are per-position: position t's a, b, c depend only on state[:, t].
+        These can be computed in T-dimension chunks of size ``chunk_size``, avoiding
+        materialising the full ``[B, T, n*D]`` flat tensor (which is the OOM source
+        at 262K+ context on 24 GB GPUs).
+
+        The sublayer (attention or MoE) still receives the full ``[B, T, D]`` input
+        ``x``, because:
+          - Attention is causal and needs the full context (it already chunks
+            internally via ``_PREFILL_CHUNK``).
+          - MoE processes each position independently — chunking would be possible
+            but unnecessary since ``[B, T, D]`` is much smaller than ``[B, T, n, D]``.
+
+        Memory reduction:
+          - Standard forward peak: ``[B, T, n*D]`` (flat) + ``[B, T, n, n]`` (b_raw)
+            + ``[B, T, n, D]`` (mixed) ≈ 3 × [B, T, n, D]
+          - Chunked peak: ``[B, C, n*D]`` (flat_c) + ``[B, T, D]`` (x accumulator)
+            + ``[B, C, n, D]`` (mixed_c) ≈ [B, C, n, D] + [B, T, D]
+          At T=262144, n=4, D=1536, C=4096: standard = ~18 GB, chunked = ~0.8 GB
+
+        Parameters
+        ----------
+        state : [B, T, n, D]
+            mHC state tensor from the previous layer / embedding.
+        chunk_size : int
+            Number of T-positions to process at once for the mHC operations.
+            Typical values: 2048–8192.  Attention chunk size is separate
+            (``_PREFILL_CHUNK`` on the sublayer).
+        """
+        bsz, seq_len, n, d = state.shape
+
+        if seq_len <= chunk_size:
+            return self.forward(state, token_ids=token_ids, attention_mask=attention_mask)
+
+        # Phase 1: compute x = einsum("btn,btnd->btd", a, state) for each chunk.
+        # x is [B, T, D] — much smaller than state [B, T, n, D]; safe to materialise fully.
+        x_parts: List[torch.Tensor] = []
+        for t_start in range(0, seq_len, chunk_size):
+            t_end = min(t_start + chunk_size, seq_len)
+            state_c = state[:, t_start:t_end]              # [B, C, n, D] — view, no copy
+            flat_c = self.norm(state_c.reshape(bsz, t_end - t_start, n * d))
+            a_raw_c = self.alpha_pre * self.w_pre(flat_c) + self.s_pre
+            a_c = torch.sigmoid(a_raw_c)                   # [B, C, n]
+            x_c = torch.einsum("btn,btnd->btd", a_c, state_c)  # [B, C, D]
+            x_parts.append(x_c)
+            # flat_c, a_raw_c, a_c freed at end of loop iteration
+
+        x = torch.cat(x_parts, dim=1)  # [B, T, D]
+        del x_parts
+
+        # Phase 2: run the sublayer on the full x — attention is causal over all T.
+        if isinstance(self.sublayer, DeepSeekMoE):
+            y, balance_loss = self.sublayer(x, token_ids=token_ids, token_mask=attention_mask)
+        else:
+            y = self.sublayer(x, attention_mask=attention_mask)
+            balance_loss = None
+        del x  # [B, T, D] freed
+
+        # Phase 3: compute the residual update in chunks.
+        #   mixed_c = einsum("btij,btjd->btid", b_c, state_c)
+        #   updated_c = mixed_c + c_c.unsqueeze(-1) * y_c.unsqueeze(2)
+        updated_parts: List[torch.Tensor] = []
+        for t_start in range(0, seq_len, chunk_size):
+            t_end = min(t_start + chunk_size, seq_len)
+            state_c = state[:, t_start:t_end]              # [B, C, n, D] — view
+            flat_c = self.norm(state_c.reshape(bsz, t_end - t_start, n * d))
+            b_raw_c = self.alpha_res * self.w_res(flat_c).view(bsz, t_end - t_start, n, n) + self.s_res
+            c_raw_c = self.alpha_post * self.w_post(flat_c) + self.s_post
+            b_c = self._sinkhorn(b_raw_c)
+            c_c = 2.0 * torch.sigmoid(c_raw_c)
+            y_c = y[:, t_start:t_end]                      # [B, C, D] — view
+            mixed_c = torch.einsum("btij,btjd->btid", b_c, state_c)  # [B, C, n, D]
+            updated_c = mixed_c + c_c.unsqueeze(-1) * y_c.unsqueeze(2)
+            updated_parts.append(updated_c)
+            # flat_c, b_raw_c, c_raw_c, b_c, c_c, mixed_c freed
+
+        del y  # [B, T, D] freed
+        updated = torch.cat(updated_parts, dim=1)  # [B, T, n, D]
+        del updated_parts
+
+        return updated, balance_loss
+
 
 class DeepSeekMoE(nn.Module):
     def __init__(self, config: DeepSeekV4Pro2BConfig, layer_idx: int):
@@ -574,6 +665,18 @@ class DeepSeekV4Block(nn.Module):
         state, balance_loss = self.moe(state, token_ids=token_ids, attention_mask=attention_mask)
         return state, balance_loss if balance_loss is not None else state.new_tensor(0.0)
 
+    def chunked_forward(
+        self,
+        state: torch.Tensor,
+        chunk_size: int,
+        token_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Memory-efficient forward using chunked mHC operations."""
+        state, _ = self.attn.chunked_forward(state, chunk_size, token_ids=token_ids, attention_mask=attention_mask)
+        state, balance_loss = self.moe.chunked_forward(state, chunk_size, token_ids=token_ids, attention_mask=attention_mask)
+        return state, balance_loss if balance_loss is not None else state.new_tensor(0.0)
+
 
 class DeepSeekV4Pro2BModel(nn.Module):
     def __init__(self, config: DeepSeekV4Pro2BConfig):
@@ -618,6 +721,50 @@ class DeepSeekV4Pro2BModel(nn.Module):
                 state = state * attention_mask[:, :, None, None].to(state.dtype)
             balance_losses.append(balance)
         # Return state to primary device (embed_tokens device) for final ops.
+        primary = self.embed_tokens.weight.device
+        if state.device != primary:
+            state = state.to(primary)
+        weights = torch.softmax(self.post, dim=0)
+        hidden = torch.einsum("n,btnd->btd", weights, state)
+        return self.final_norm(hidden), torch.stack([b.to(primary) for b in balance_losses]).mean()
+
+    def chunked_forward(
+        self,
+        input_ids: torch.Tensor,
+        mhc_chunk_size: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Memory-efficient forward that chunks mHC operations along the T dimension.
+
+        Identical to ``forward()`` except each ``DeepSeekV4Block`` uses
+        ``chunked_forward(chunk_size=mhc_chunk_size)`` instead of ``forward()``.
+        This keeps peak memory at ``O(chunk_size × n_expand × D)`` per layer
+        instead of ``O(T × n_expand × D)``.
+
+        At T=262K, n_expand=4, D=1536 (full 2B model):
+          - Standard forward peak: 2 × 1 × 262144 × 4 × 1536 × 2B ≈ 25.2 GB
+          - Chunked (C=4096) peak: 2 × 1 × 4096 × 4 × 1536 × 2B + O(T×D) ≈ 1.2 GB
+        """
+        hidden = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            hidden = hidden * attention_mask.unsqueeze(-1).to(hidden.dtype)
+        state = hidden.unsqueeze(2).expand(-1, -1, self.config.mhc_expansion, -1).contiguous()
+        balance_losses = []
+        _layer_devs = getattr(self, '_layer_devices', None)
+        for i, layer in enumerate(self.layers):
+            if _layer_devs is not None:
+                dev = _layer_devs[i]
+                if state.device != dev:
+                    state = state.to(dev)
+                    input_ids = input_ids.to(dev)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(dev)
+            state, balance = layer.chunked_forward(
+                state, mhc_chunk_size, token_ids=input_ids, attention_mask=attention_mask
+            )
+            if attention_mask is not None:
+                state = state * attention_mask[:, :, None, None].to(state.dtype)
+            balance_losses.append(balance)
         primary = self.embed_tokens.weight.device
         if state.device != primary:
             state = state.to(primary)

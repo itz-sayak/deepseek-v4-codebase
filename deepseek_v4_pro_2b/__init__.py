@@ -2,7 +2,7 @@
 
 from .configuration import DeepSeekV4Pro2BConfig
 
-__all__ = ["DeepSeekV4Pro2BConfig", "DeepSeekV4Pro2BForCausalLM", "DeepSeekV4Pro2BModel", "DeepSeekV4Pro2BServingEngine", "Muon"]
+__all__ = ["DeepSeekV4Pro2BConfig", "DeepSeekV4Pro2BForCausalLM", "DeepSeekV4Pro2BModel", "DeepSeekV4Pro2BServingEngine", "Muon", "SpeculativeDecoder", "SpecDecodeSummary"]
 
 
 def __getattr__(name: str):
@@ -21,4 +21,10 @@ def __getattr__(name: str):
         from .muon import Muon
 
         return Muon
+    if name in {"SpeculativeDecoder", "SpecDecodeSummary", "SpecDecodeResult"}:
+        from .speculative import SpeculativeDecoder, SpecDecodeSummary, SpecDecodeResult
+
+        return {"SpeculativeDecoder": SpeculativeDecoder,
+                "SpecDecodeSummary": SpecDecodeSummary,
+                "SpecDecodeResult": SpecDecodeResult}[name]
     raise AttributeError(name)

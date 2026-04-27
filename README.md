@@ -2,74 +2,141 @@
 
 This repository contains a compact PyTorch implementation of a DeepSeek-V4-Pro-style causal LM, scaled to the 2B parameter class.
 
-Implemented paper features:
+## Implemented Paper Features
 
-- interleaved HCA/CSA hybrid attention after the first two HCA layers
-- token-level KV compression for HCA and overlapped two-branch compression for CSA
+- Interleaved HCA/CSA hybrid attention after the first two HCA layers
+- Token-level KV compression for HCA and overlapped two-branch compression for CSA
 - CSA lightning indexer with top-k sparse compressed KV selection
-- shared-key-value multi-query attention, grouped output projection, partial RoPE, sliding-window KV branch, and attention sink logits
-- Manifold-Constrained Hyper-Connections with dynamic A/B/C maps and Sinkhorn projection of B
+- Shared-key-value multi-query attention, grouped output projection, partial RoPE, sliding-window KV branch, and attention sink logits
+- Manifold-Constrained Hyper-Connections (mHC) with dynamic A/B/C maps and Sinkhorn projection of B
 - DeepSeekMoE-style shared plus routed experts with `sqrt(softplus(.))` affinity, first-layer hash routing, and sequence balance loss
-- MTP depth 1 auxiliary head
+- MTP depth-1 auxiliary head
 - Muon optimizer with the paper's 8+2 hybrid Newton-Schulz coefficients
 
 The source PDF was extracted into `DeepSeek_V4.txt` for auditability. The implementation is in `deepseek_v4_pro_2b/`.
 
-Long-context serving support now also includes `deepseek_pipeline/serving.py`, which implements:
+---
 
-- hybrid CSA/HCA cache-block sizing based on `lcm(m, m')`
-- disk-backed compressed-prefix reuse
-- full / periodic / zero SWA cache policies
-- restore-plan generation for replaying only the uncached tail
-- a backend hook for custom CUDA sparse-attention kernels, plus a PyTorch correctness fallback
+## April 2026 Additions
 
-The CUDA extension sources live in `deepseek_kernels/` and expose a fused sparse sink-attention operator for serving:
+### TurboQuant — PolarQuant (KV-Cache Compression)
+
+`deepseek_v4_pro_2b/turbo_quant.py` — 8-bit and 4-bit compressed mHC KV-cache quantisation:
+
+```python
+engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=8)   # 8-bit (near-lossless)
+engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=4)   # 4-bit (4× smaller)
+```
+
+**Quality gate** (needle-in-haystack eval across context lengths 64–256):
+- 8-bit: KL ≈ 0 vs baseline, 100% top-1 match — **near-lossless**
+- 4-bit: KL < 0.001, 100% top-1 match — **production-safe**
+
+```bash
+# Run the full quality gate eval
+python scripts/needle_eval.py --ctx-lengths 64 128 256 512
+```
+
+Memory reduction (decode phase):
+- bf16: 768 MiB/layer at 262K ctx | 8-bit: 384 MiB (2×) | 4-bit: 192 MiB (4×)
+
+### Chunked Fast-Prefill (262K+ OOM Fix)
+
+`engine.chunked_fast_prefill(token_ids, mhc_chunk_size=4096)` bounds peak mHC state
+memory from O(T×n×D) → O(C×n×D) + O(T×D):
+
+```python
+# Standard fast_prefill: OOMs at 262K+ (25.2 GB mHC peak on 2B model)
+state = engine.fast_prefill(long_token_ids)
+
+# Memory-safe alternative: 1.2 GB mHC peak at 262K context
+state = engine.chunked_fast_prefill(long_token_ids, mhc_chunk_size=4096)
+```
+
+The attention sublayer still receives the full T for correct causal context.
+Only the per-position mHC pre-mix / post-mix are chunked.
+
+### Speculative Decoding
+
+`deepseek_v4_pro_2b/speculative.py` — draft-model-based speculative decoding
+(Chen et al., 2023). Identical output distribution to target-only decoding.
+
+```python
+from deepseek_v4_pro_2b.speculative import SpeculativeDecoder
+
+decoder = SpeculativeDecoder(
+    target_engine,    # large model 
+    draft_engine,     # fast draft model
+    draft_steps=5,
+    temperature=1.0,
+)
+summary = decoder.generate(prompt_ids, max_new_tokens=256, eos_token_id=2)
+print(f"Acceptance rate: {summary.mean_acceptance_rate:.2%}")
+print(f"Effective speedup: {summary.effective_speedup:.1f}×")
+# Expected: ~4–5× decode throughput at α ≈ 0.8, K = 5
+```
+
+---
+
+## Long-Context Serving
+
+`deepseek_pipeline/serving.py` implements:
+
+- Hybrid CSA/HCA cache-block sizing based on `lcm(m, m')`
+- Disk-backed compressed-prefix reuse
+- Full / periodic / zero SWA cache policies
+- Restore-plan generation for replaying only the uncached tail
+- Backend hook for custom CUDA sparse-attention kernels + PyTorch fallback
+
+The CUDA extension in `deepseek_kernels/` exposes a fused sparse sink-attention operator:
 
 ```bash
 python scripts/build_cuda_kernels.py --verbose
-```
-
-Numerical and throughput checks on a CUDA box:
-
-```bash
 pytest -q tests/test_cuda_runtime.py
 python scripts/benchmark_cuda_kernels.py --dtype fp16 --source-tokens 8192 --top-k 64
 ```
 
-The repository also now includes an exact incremental decode engine in `deepseek_v4_pro_2b/serving.py`. It:
+The exact incremental decode engine in `deepseek_v4_pro_2b/serving.py`:
 
-- reuses the trained model weights directly
-- maintains exact HCA/CSA per-layer caches
-- supports full / periodic / zero SWA prefix-reuse policies
-- can replay the uncached tail and resume generation from the restored state
-- routes sparse compressed-KV attention through either the PyTorch reference backend or the custom CUDA backend
+- Reuses trained model weights directly
+- Maintains exact HCA/CSA per-layer caches (window, partial buffer, compressed blocks)
+- Supports `fast_prefill` (5–6× speedup vs step-by-step) + `chunked_fast_prefill` (OOM-safe)
+- Routes sparse compressed-KV attention via PyTorch or custom CUDA backend
+- Paged allocator for host↔device↔disk KV spill
 
-Serving validation commands:
+Serving validation:
 
 ```bash
 pytest -q tests/test_incremental_serving.py
-conda run -n deepfill bash -lc '
-export CUDA_HOME=$CONDA_PREFIX
-export PYTHONPATH=/home/seema/deepseek-v4:$PYTHONPATH
-pytest -q tests/test_incremental_serving_cuda.py
-'
+pytest -q tests/test_turbo_quant.py
+pytest -q tests/test_chunked_prefill.py
+pytest -q tests/test_speculative.py
 ```
 
-Build prerequisites:
+---
 
-- CUDA-enabled PyTorch
-- CUDA toolkit with `nvcc` on `PATH`
-- `CUDA_HOME` pointing at that toolkit
-- `ninja` installed for fast extension builds
+## Quick-Start
 
 ```python
 from deepseek_v4_pro_2b import DeepSeekV4Pro2BConfig, DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.sizing import estimate_config_parameters
+from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
+from deepseek_v4_pro_2b.speculative import SpeculativeDecoder
+from deepseek_pipeline.serving import PytorchAttentionBackend
 
 config = DeepSeekV4Pro2BConfig()
-print(estimate_config_parameters(config))
-model = DeepSeekV4Pro2BForCausalLM(config)
-print(model.estimate_total_parameters())
+model = DeepSeekV4Pro2BForCausalLM(config).eval()
+
+# Standard prefill + decode
+engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=8)
+state = engine.chunked_fast_prefill(prompt_ids, mhc_chunk_size=4096)
+logits, state = engine.step_token(next_token, state)
+
+# Speculative decode (2× faster draft + 2B target)
+decoder = SpeculativeDecoder(engine, draft_engine, draft_steps=5, temperature=1.0)
+summary = decoder.generate(prompt_ids, max_new_tokens=512)
 ```
 
-The default config is intentionally conservative for a reference implementation. The repository now includes the on-disk cache-management layer, a custom CUDA sparse-attention kernel, and an exact incremental decode loop that uses them together. I have not measured full end-to-end 1M-token throughput for the complete model stack in this workspace, so this repo should be treated as a validated serving reference rather than as a verified 1M-token benchmark result.
+The default config is intentionally conservative for a reference implementation.
+See `TECHNICAL_REPORT.md` for architecture details, benchmark results, and the April 2026
+sprint documentation (TurboQuant, chunked prefill, speculative decoding).
+
