@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+artifacts/smoke/checkpoints/
+artifacts/smoke/datasets/
+artifacts/smoke/tokenized/
+*.zip
+.DS_Store
