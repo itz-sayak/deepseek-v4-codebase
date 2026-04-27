@@ -189,9 +189,13 @@ Long-context serving additions:
 - A real CUDA extension package now exists in `deepseek_kernels/` with:
   - C++/PyBind entrypoints in `deepseek_kernels/csrc/bindings.cpp`
   - a fused sparse sink-attention CUDA kernel in `deepseek_kernels/csrc/sparse_sink_attention_cuda.cu`
+  - a tiled long-context prefill CUDA kernel in `deepseek_kernels/csrc/tiled_prefill_cuda.cu`
+  - a fused CSA lightning indexer CUDA kernel in `deepseek_kernels/csrc/csa_indexer_cuda.cu`
+  - a fused HCA compression CUDA kernel in `deepseek_kernels/csrc/hca_compress_cuda.cu`
   - a lazy build/load path in `deepseek_kernels/loader.py`
   - a build entrypoint in `scripts/build_cuda_kernels.py`
 - The serving layer exposes `CudaSparseAttentionBackend`, which can replace the PyTorch fallback when the extension is built successfully
+- The CUDA path is validated by `tests/test_cuda_runtime.py` and `tests/test_incremental_serving_cuda.py`, and benchmarked via `scripts/benchmark_cuda_kernels.py` plus the end-to-end serving benchmark
 - An exact incremental serving engine now exists in `deepseek_v4_pro_2b/serving.py`:
   - it performs token-by-token decode using the same trained weights as the full model
   - it maintains exact HCA and CSA layer state, including partial compression buffers and local sliding-window state

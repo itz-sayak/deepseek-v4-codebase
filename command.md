@@ -93,9 +93,19 @@ torchrun --nproc_per_node=2 train_end_to_end.py \
 
 ## 8) Optional: Build and Validate CUDA Kernels
 
+If your environment does not already have the CUDA toolkit packages used by the
+validated build, install them into `deepfill` first and point `CUDA_HOME` at the
+active conda prefix:
+
+```bash
+conda install -n deepfill -y -c nvidia cuda-nvcc=12.1 cuda-cudart-dev=12.1
+export CUDA_HOME=$CONDA_PREFIX
+```
+
 ```bash
 python scripts/build_cuda_kernels.py --verbose
 pytest -q tests/test_cuda_runtime.py
+pytest -q tests/test_incremental_serving_cuda.py
 python scripts/benchmark_cuda_kernels.py --dtype fp16 --source-tokens 8192 --top-k 64
 ```
 

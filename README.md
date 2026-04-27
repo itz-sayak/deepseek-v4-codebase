@@ -88,11 +88,21 @@ print(f"Effective speedup: {summary.effective_speedup:.1f}×")
 - Restore-plan generation for replaying only the uncached tail
 - Backend hook for custom CUDA sparse-attention kernels + PyTorch fallback
 
-The CUDA extension in `deepseek_kernels/` exposes a fused sparse sink-attention operator:
+The CUDA extension in `deepseek_kernels/` exposes the custom serving kernels used
+by this repo:
+
+- fused sparse sink-attention operator
+- tiled long-context prefill kernel
+- CSA lightning indexer kernel
+- HCA compression kernel
+- lazy build/load path via `deepseek_kernels/loader.py`
+
+Validation and benchmark commands:
 
 ```bash
 python scripts/build_cuda_kernels.py --verbose
 pytest -q tests/test_cuda_runtime.py
+pytest -q tests/test_incremental_serving_cuda.py
 python scripts/benchmark_cuda_kernels.py --dtype fp16 --source-tokens 8192 --top-k 64
 ```
 

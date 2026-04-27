@@ -113,6 +113,12 @@ These are the hardest items and block 1M-token throughput measurement.
   batch; per-position softmax + weighted sum. Python wrapper `hca_compress()` in
   `sparse_attention.py`. Full RoPE rotation applied in Python post-kernel.
 
+- [x] **CUDA extension build/load path**  
+  `deepseek_kernels/loader.py` lazily compiles/loads the extension through
+  `scripts/build_cuda_kernels.py`; `tests/test_cuda_runtime.py` and
+  `tests/test_incremental_serving_cuda.py` validate the compiled path, and
+  `CudaSparseAttentionBackend` provides the serving-time switch.
+
 ---
 
 ## 2  Decode scheduler and batching  ✅ COMPLETED
