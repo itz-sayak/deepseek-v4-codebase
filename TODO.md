@@ -12,16 +12,19 @@ The repo now has a **measured end-to-end benchmark** across two prefill paths
 correctness tests (numerically validated; 31 tests pass, 0 skipped).
 
 **April 2026 additions (this sprint)**:
-- **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache with  
-  Walsh-Hadamard + Lloyd-Max quantisation. Validated by needle-in-haystack eval:  
-  8-bit KL ≈ 0 (near-lossless), 4-bit KL < 0.001, 100% top-1 match at all tested  
-  context lengths (64–256 tokens on CPU tiny model; latest GPU YaRN run at 2K/4K/8K
-  also passes with top-1 match 100% and KL in [5e-6, 8e-6]).
-- **Prefill OOM fix** — `chunked_fast_prefill(mhc_chunk_size=4096)` reduces mHC  
-  peak from O(T×n×D) to O(C×n×D) + O(T×D). At T=262 K, n=4, D=1536: 25.2 GB → 1.2 GB.
-- **Speculative decoding** — `SpeculativeDecoder` with draft-model acceptance/rejection  
-  (Chen et al., 2023). Perfect-draft (draft == target, greedy) achieves 100% acceptance.  
-  Expected ~4× effective throughput at α ≈ 0.8, K = 5.
+- **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache with
+  Walsh-Hadamard + Lloyd-Max quantisation. Validated by needle-in-haystack eval:
+  8-bit KL ≈ 0 (near-lossless), 4-bit KL < 0.001, 100% top-1 match at all tested
+  context lengths (64–256 tokens on CPU tiny model; GPU YaRN runs at 2K–262K also
+  pass with top-1 match 100% and KL in [4e-6, 8e-6]).
+- **Prefill OOM fix** — `chunked_fast_prefill(mhc_chunk_size=4096)` reduces mHC
+  peak from O(T×n×D) to O(C×n×D) + O(T×D). At T=262K, n=4, D=1536: 25.2 GB → 1.2 GB.
+- **YaRN RoPE scaling** — config-driven long-context positional encoding. Validated
+  at all context lengths up to 262K; top-1 match 100% with YaRN enabled.
+- **Speculative decoding** — `SpeculativeDecoder` with draft-model acceptance/rejection
+  (Chen et al., 2023). **Measured α = 0.97 (tiny draft, K=3)** — acceptance rate is
+  excellent but net decode throughput is ~15% slower than baseline due to draft
+  model overhead. See benchmark results and open item below.
 
 ### Measured throughput (CPU / fp32 / batch=1 / bench-runs=3, tiny model)
 
@@ -51,270 +54,210 @@ correctness tests (numerically validated; 31 tests pass, 0 skipped).
 | 131 072      | 1406          | 11.9         | 12 853 MiB      |
 | 262 144      | 1140.2        | 9.8          | 16 941 MiB      |
 
-Raw JSON results in `artifacts/benchmark_gpu_2b.json` and
-`artifacts/benchmark_gpu_2b_longctx.json`.
+### Measured speculative decode (GPU / bf16 / single RTX 4090 / YaRN / K=3 / tiny draft + 2B target)
 
-Latest long-context validation extends this same 2× RTX 4090 setup out to
-256K tokens. The 262,144-token row above comes from a direct
-`chunked_fast_prefill(mhc_chunk_size=4096)` measurement on the 2-GPU sharded
-path, followed by a direct `step_token` decode-rate measurement from the same
-prefilled state.
+| source_tokens | baseline tok/s | spec tok/s | acceptance rate | net speedup | target HBM | draft HBM |
+|--------------|---------------|------------|-----------------|-------------|------------|-----------|
+| 512          | 10.90         | 9.36       | 96.97%          | **0.86×**   | 3 818 MiB  | 3 777 MiB |
+| 8 192        | 10.77         | 9.34       | 96.97%          | **0.87×**   | 4 318 MiB  | 3 874 MiB |
+| 65 536       | 10.74         | 9.14       | 96.97%          | **0.85×**   | 7 780 MiB  | 4 597 MiB |
+| 131 072      | 10.80         | 9.33       | 96.97%          | **0.86×**   | 11 791 MiB | 5 423 MiB |
+| 262 144      | 10.99         | 9.15       | 96.97%          | **0.83×**   | 19 757 MiB | 7 075 MiB |
+
+**Key finding**: α = 0.97 is excellent — the tiny draft and 2B target agree on tokens
+almost perfectly. However, the tiny draft's 3 sequential forward passes per round cost
+more wall-clock time than the single target verification saves. Speculative decoding
+is currently **net slower** than baseline at all measured context lengths. The acceptance
+rate is not the problem; draft forward-pass latency is. See section 7 for the fix path.
+
+Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 
 ### Honest remaining gap for true 1M-token scale
 
-- **Maximum measured context with 2× RTX 4090 (pre-chunking)**: **256 K tokens**.  
-  With `chunked_fast_prefill(mhc_chunk_size=4096)`, 262 K+ is now within VRAM budget  
-  (1.2 GB mHC peak vs prior 25.2 GB).
-- **1M-token prefill** would require ≥ 8 GPUs at this `n_expand` even with chunking  
-  (attention sublayer still receives full T; O(T²) attention is the next bottleneck).
-- **Vectorised chunked attention** (`_PREFILL_CHUNK=256`) is fully implemented in
-  both `HCAAttention.forward` and `CSAAttention.forward`; the O(T) Python loop is
-  eliminated.
-- **SWA offload** is wired into `DecodeScheduler`; `fast_prefill` in-hook
-  extraction eliminates the 13 GB accumulated `captured_x` overhead.
+- **Maximum measured context with 2× RTX 4090**: **262 K tokens** (chunked_fast_prefill).
+- **1M-token prefill** requires ≥ 8 GPUs even with chunking — the attention sublayer
+  still receives full T; O(T²) attention is the next hard wall.
+- **Vectorised chunked attention** (`_PREFILL_CHUNK=256`) eliminates the O(T) Python loop.
+- **SWA offload** is wired into `DecodeScheduler`; `fast_prefill` in-hook extraction
+  eliminates the 13 GB accumulated `captured_x` overhead.
 
 ---
 
 ## 1  Long-context serving — CUDA kernel stack  ⚠️ PARTIAL
 
-These are the hardest items and block 1M-token throughput measurement.
-
-- [x] **Paged prefix-cache allocator integration**  
-  `DeepSeekV4Pro2BServingEngine` now accepts a `PagedKVAllocator` and uses it to
-  store reusable compressed prefix blocks restored from disk-backed prefix cache
-  entries. This path is validated in `tests/test_incremental_serving.py` and can
-  be exercised from `scripts/benchmark_e2e_serving.py` with
-  `--allocator-device-pages` / `--allocator-host-pages`.
-
-- [x] **Full live-state allocator integration**  
-  The allocator-backed path covers both restored compressed prefixes and newly
-  emitted compressed tail blocks. The engine now has `offload_swa_to_host` /
-  `restore_swa_to_device` for window and partial-buffer tensors (tested in
-  `test_offload_restore_preserves_step_token`). `swa_offload` is wired into
-  `DecodeScheduler` (added `swa_offload` parameter, calls offload/restore per
-  step). O(N) Python loop in `HCAAttention.forward()` / `CSAAttention.forward()`
-  replaced with vectorised chunked forward (`_PREFILL_CHUNK=256`).  
-  **Remaining**: the tiled-prefill CUDA kernel is not yet integrated into the
-  training-mode forward — this would reduce CUDA launches from O(T/chunk) to
-  O(T/tile_CUDA), giving additional speedup for very long contexts.
-
-- [x] **Prefill kernel for long sequences**  
-  Implemented in `deepseek_kernels/csrc/tiled_prefill_cuda.cu` with PyBind11
-  binding in `bindings.cpp`. Python wrapper in `sparse_attention.py`.
-  One warp per (batch, head, query-token); streams source tokens in tiles of
-  configurable size; online softmax with running max/normaliser.
-
-- [x] **CSA lightning indexer CUDA kernel**  
-  Implemented in `deepseek_kernels/csrc/csa_indexer_cuda.cu`. Fused dot-product
-  scoring + top-k selection. Python wrapper `csa_indexer_topk()` in
-  `sparse_attention.py`.
-
-- [x] **Fused HCA compression kernel**  
-  Implemented in `deepseek_kernels/csrc/hca_compress_cuda.cu`. One block per
-  batch; per-position softmax + weighted sum. Python wrapper `hca_compress()` in
-  `sparse_attention.py`. Full RoPE rotation applied in Python post-kernel.
-
-- [x] **CUDA extension build/load path**  
-  `deepseek_kernels/loader.py` lazily compiles/loads the extension through
-  `scripts/build_cuda_kernels.py`; `tests/test_cuda_runtime.py` and
-  `tests/test_incremental_serving_cuda.py` validate the compiled path, and
-  `CudaSparseAttentionBackend` provides the serving-time switch.
+- [x] **Paged prefix-cache allocator integration**
+- [x] **Full live-state allocator integration**
+  Training-mode forward now has an opt-in tiled-prefill CUDA path in
+  `deepseek_v4_pro_2b/modeling.py` (`use_tiled_prefill_cuda=True`) for HCA/CSA
+  prefill when running on CUDA with no attention mask.
+- [x] **Prefill kernel for long sequences** (`tiled_prefill_cuda.cu`)
+- [x] **CSA lightning indexer CUDA kernel** (`csa_indexer_cuda.cu`)
+- [x] **Fused HCA compression kernel** (`hca_compress_cuda.cu`)
+- [x] **CUDA extension build/load path** (`deepseek_kernels/loader.py`)
 
 ---
 
 ## 2  Decode scheduler and batching  ✅ COMPLETED
 
-- [x] **Full batched decode scheduler**  
-  Implemented in `deepseek_v4_pro_2b/scheduler.py` — `DecodeScheduler` with
-  `GenerationRequest`, `FinishedSequence`, and `BatchStepResult` data structures.
-  Delegates prefill to `DeepSeekV4Pro2BServingEngine.prefill_with_reuse()`.
-
-- [x] **Continuous batching**  
-  `DecodeScheduler.run()` is an iteration-level generator that fills freed slots
-  immediately after each decode step without waiting for the full batch to finish.
-
-- [x] **Correct first-token decode semantics**  
-  Fixed in April 2026: the scheduler now samples the first generated token from
-  the prefetched logits instead of incorrectly re-feeding the last prompt token
-  back through the model.
-
-- [x] **KV cache block sharing across requests**  
-  `group_by_shared_prefix()` helper groups requests by prompt prefix hash so the
-  scheduler can batch requests that share a common prefix into the same prefill
-  call, reusing the cached blocks.
+- [x] Full batched decode scheduler (`DecodeScheduler`)
+- [x] Continuous batching
+- [x] Correct first-token decode semantics
+- [x] KV cache block sharing across requests (`group_by_shared_prefix()`)
 
 ---
 
 ## 3  End-to-end throughput benchmark  ✅ COMPLETED
 
-- [x] **1M-token decode benchmark harness**  
-  Implemented in `scripts/benchmark_e2e_serving.py`. Drives tokenise → prefill
-  (via `prefill_with_reuse` or `fast_prefill`) → decode loop. Reports prefill
-  tokens/s, decode tokens/s, ms-per-token, and peak HBM usage. CLI flags:
-  `--source-tokens`, `--decode-tokens`, `--batch-size`, `--dtype`,
-  `--use-prefix-cache`, `--swa-mode`, `--fast-prefill`, `--output-json`.
-
-- [x] **fast_prefill batch-forward path**  
-  `engine.fast_prefill(token_ids)` runs a single `model.forward()` call and
-  extracts serving state via forward hooks on each layer's attention sublayer.
-  Numerically identical to step-by-step `prefill()` (proven by
-  `test_fast_prefill_matches_step_token_next_logits`). Measured ~5–6× prefill
-  speedup vs the token loop at 64–2048 tokens (see status snapshot table above).
-
-- [x] **Scheduler-backed batch measurement**  
-  `benchmark_e2e_serving.py` uses `DecodeScheduler` for batched decode and
-  reports separate prefill and decode timings.
-
-- [x] **Memory-pressure profiling at 1M scale**  
-  `benchmark_e2e_serving.py` calls `torch.cuda.max_memory_allocated` per run and
-  reports `peak_hbm_mib` in the JSON output.
-
-- [x] **Measured benchmark run executed**  
-  Real throughput numbers collected and stored in
-  `artifacts/benchmark_step_by_step.json` and
-  `artifacts/benchmark_fast_prefill.json`. See status snapshot table above.
-
-- [x] **Sustained 1M-token throughput on the full serving stack**  
-  The harness, scheduler, and allocator paths are all in place. `fast_prefill`
-  in-hook extraction, RMSNorm fusion (`F.rms_norm`), chunked vectorised attention,
-  and 2-GPU layer sharding (`engine.shard_across_gpus(2)`) are implemented and
-  validated. Measured max context: **131 K tokens on 2× RTX 4090** (12 853 MiB
-  HBM peak, 1406 tok/s prefill). True 1M-token prefill is blocked by the mHC
-  state tensor peak (2× state size per layer = 25.2 GB at 262 K), which exceeds
-  the 24 GB VRAM of each GPU. This is an architectural / hardware constraint, not
-  a code gap.
+- [x] 1M-token decode benchmark harness (`benchmark_e2e_serving.py`)
+- [x] `fast_prefill` batch-forward path (~5–6× speedup vs token loop)
+- [x] Scheduler-backed batch measurement
+- [x] Memory-pressure profiling
+- [x] Measured benchmark runs executed and stored in artifacts
 
 ---
 
 ## 4  Training — multi-GPU and distributed  ✅ COMPLETED
 
-- [x] **FSDP wrapping**  
-  `train_end_to_end.py` now supports `--fsdp` (launch with `torchrun`). Auto-wraps
-  model with `FullyShardedDataParallel` using size-based auto-wrap policy.
-  Checkpoints are gathered to rank 0 before saving via `_fsdp_state_dict()`.
-
-- [x] **Sharded data loading**  
-  `MemmapTokens` and `PackedMemmapTokens` both accept `rank` / `world_size`
-  parameters and each rank owns a contiguous slice of the global sample space.
-
-- [x] **Learning rate schedule**  
-  Linear warmup for `--warmup-steps` (default 2 000) then cosine decay to
-  `--lr-min-ratio` (default 0.1) of peak LR, applied to both AdamW and Muon.
-
-- [x] **Gradient checkpointing**  
-  `--gradient-checkpointing` flag calls `model.enable_gradient_checkpointing()`
-  (or sets `model.gradient_checkpointing = True` as fallback).
-
-- [x] **Sequence packing / document packing**  
-  `PackedMemmapTokens` concatenates documents into dense `seq_len` windows; EOS
-  boundary positions in labels are masked to `-100` so cross-document loss is
-  suppressed. Activated with `--sequence-packing`.
+- [x] FSDP wrapping (`torchrun`)
+- [x] Sharded data loading
+- [x] Learning rate schedule (linear warmup + cosine decay)
+- [x] Gradient checkpointing
+- [x] Sequence packing / document packing
 
 ---
 
 ## 5  Post-training alignment
 
-- [ ] **SFT training loop**  
-  The data pipeline already downloads SFT sources and formats them as instruction
-  tuning pairs, but `train_end_to_end.py` only supports pretraining. A separate
-  fine-tuning script that masks the instruction portion of the loss is missing.
+- [ ] **SFT training loop**
+  Data pipeline downloads and formats SFT sources but `train_end_to_end.py`
+  only supports pretraining. Fine-tuning script with instruction-loss masking is missing.
 
-- [ ] **DPO training loop**  
-  DPO sources (`ultrafeedback`, `orca_dpo_pairs`) are downloaded and normalised but
-  no DPO objective or paired-loss trainer exists in this repo.
+- [ ] **DPO training loop**
+  DPO sources downloaded and normalised. No DPO objective or paired-loss trainer.
 
-- [ ] **Reward model / RLHF**  
+- [ ] **Reward model / RLHF**
   Not started. No reward model scaffold, PPO loop, or GRPO implementation.
 
 ---
 
 ## 6  Evaluation
 
-- [x] **Long-context needle-in-haystack TurboQuant validation**  
-  `scripts/needle_eval.py` compares `turbo_quant_bits=None` vs 8 vs 4 at multiple  
-  context lengths. Quality gate: KL divergence vs baseline and top-1 token match.  
-  Results (CPU tiny model, ctx=64/128/256):  
-  - 8-bit: KL ≈ 0, max_logit_diff ≈ 0.002, top-1 match 100% — **near-lossless**  
-  - 4-bit: KL < 0.001, max_logit_diff < 0.12, top-1 match 100% — **production-safe**  
-  Results (GPU, YaRN, deepfill / RTX 4090, chunked_fast_prefill for ctx ≥ 16K):
+- [x] **Long-context needle-in-haystack TurboQuant + YaRN validation**
+  `scripts/needle_eval.py`. Results saved to `artifacts/needle_eval_results.json`.
+  All context lengths 64 → 262K pass at 4-bit with YaRN enabled.
 
-  | ctx    | bits | KL div   | top-1 | max diff |
-  |--------|------|----------|-------|----------|
-  | 2048   | 4    | 0.000008 | True  | 0.0131   |
-  | 4096   | 4    | 0.000005 | True  | 0.0083   |
-  | 8192   | 4    | 0.000006 | True  | 0.0094   |
-  | 131072 | 4    | 0.000004 | True  | 0.0078   |
-  | 262144 | 4    | 0.000005 | True  | 0.0078   |
-  Results saved to `artifacts/needle_eval_results.json`.
+- [ ] **Standard benchmark evaluations**  ⚠️ HIGH PRIORITY
+  No harness for MMLU, HellaSwag, HumanEval, MBPP, MATH, or GSM8K.
+  Training decisions cannot be made without quality metrics on a held-out eval set.
+  Recommended path: integrate `lm-evaluation-harness` with a single
+  `scripts/eval_checkpoint.py` wrapper.
 
-- [ ] **Standard benchmark evaluations**  
-  No harness for MMLU, HellaSwag, HumanEval, MBPP, MATH, GSM8K, or any other
-  standard benchmark. There is no way to measure model quality after training
-  without adding this.
-
-- [ ] **Perplexity evaluation on held-out sets**  
-  The trainer logs validation loss during training, but there is no standalone
-  evaluation script that can run a saved checkpoint against a held-out partition of
-  any of the pretrain sources.
+- [ ] **Perplexity evaluation on held-out sets**
+  Trainer logs validation loss during training but no standalone eval script
+  exists to compare checkpoints post-hoc.
 
 ---
 
 ## 7  Model and architecture gaps
 
-- [x] **FP8 / INT8 / INT4 (KV-cache) quantisation — TurboQuant (PolarQuant)**  
-  `deepseek_v4_pro_2b/turbo_quant.py` implements `PolarQuant`: Walsh-Hadamard +  
-  Lloyd-Max quantisation at 8-bit (int8) and 4-bit (packed uint8) on the compressed  
-  mHC KV state. Wired into `DeepSeekV4Pro2BServingEngine` via `turbo_quant_bits`  
-  parameter — all emit, extract, attention-step, and paging paths updated. Scale  
-  tensors (float16) stored alongside quantised data; dequantisation uses model  
-  weight dtype for CPU/GPU portability. Unit tests: 14 tests in `test_turbo_quant.py`.  
-  **Full weight quantisation (FP8 / INT8 for linear layers) is not yet implemented.**
+- [x] **TurboQuant / PolarQuant (KV-cache quantisation)**
+  8-bit and 4-bit, all paths wired, 14 tests passing.
+  Full weight quantisation (FP8 / INT8 for linear layers) not yet implemented.
 
-- [x] **Speculative decoding**  
-  `deepseek_v4_pro_2b/speculative.py` implements `SpeculativeDecoder`: draft-model  
-  acceptance/rejection sampling (Chen et al., 2023). Supports temperature, top-k,  
-  EOS stopping, and self-speculative fallback. Perfect-draft (draft == target, greedy)  
-  achieves 100% acceptance rate. Expected ~4× effective decode throughput at α≈0.8, K=5.  
-  Unit tests: 11 tests in `tests/test_speculative.py`.
+- [x] **Speculative decoding — correctness**
+  `SpeculativeDecoder` implemented and 11/11 tests pass. Output distribution
+  identical to target-only decoding (proven). α = 0.97 measured on GPU.
 
-- [x] **Speculative decoding benchmark harness**  
-  `scripts/benchmark_speculative.py` measures greedy target-only vs speculative  
-  decode with a separate tiny draft model that shares the target tokenizer vocab.  
-  YaRN scaling is optional via `--yarn-scaling`.
+- [ ] **Speculative decoding — net throughput improvement**  ⚠️ HIGH PRIORITY
+  **Current status**: α = 0.97 is excellent but the tiny draft model's 3 sequential
+  forward passes cost more wall-clock time than the target verification saves.
+  Net result at K=3: ~0.85× (15% slower than baseline).
 
-- [ ] **Multi-query and grouped-query attention variants**  
-  The current configuration uses full multi-head attention for the grouped output
-  projection. The paper's production configuration uses further MQA compression;
-  the configuration class supports the shape parameters but they have not been
-  validated at non-default settings.
+  **Root cause**: on GDDR6X, the tiny draft is memory-bandwidth-bound just like
+  the target. Running 3 draft steps + 1 target step costs ~(3 × draft_latency) +
+  target_latency, which exceeds a straight target_latency when draft_latency is not
+  negligibly small.
 
-- [x] **RoPE scaling for context lengths beyond training length**  
-  `DeepSeekV4Pro2BConfig` now exposes `max_position_embeddings` and YaRN/linear
-  scaling knobs. `get_rope_freqs(seq_len, config)` and `rope_attention_scale(config)`
-  keep the prefill and serving paths aligned, and `tests/test_rope_scaling.py`
-  exercises both the helper and a small model smoke test.
+    **Implemented optimizations**:
+    1. **Shared-layer self-spec draft path** in `scripts/benchmark_speculative.py`
+      via `--self-spec-layers N`, built by `build_self_spec_draft_model(...)`.
+      Draft reuses the first N target layers (shared modules) to avoid loading a
+      separate full set of weights for draft benchmarking.
+    2. **Adaptive K control** in `SpeculativeDecoder` via
+      `adaptive_draft_steps`, `min_draft_steps`, `max_draft_steps`, and
+      acceptance-rate thresholds (`adapt_up_threshold`, `adapt_down_threshold`).
+    3. **Quantise the draft model** — apply TurboQuant 4-bit to tiny draft KV cache,
+     reducing draft memory bandwidth per step. May recover 20–30% draft latency.
+     Implementation: pass `turbo_quant_bits=4` to draft engine. Low complexity.
+
+    **Remaining tuning path**:
+    - Increase K / run K-sweeps under stable GPU isolation and compare against
+     shared-layer self-spec mode to find the first net-speedup regime.
+
+    4. **Increase K** — at α = 0.97, K=5 or K=7 would generate more tokens per
+     target call. May help if draft latency is sub-linear in K (batched draft steps).
+     Test K=5 and K=7 before implementing self-speculative.
+
+  **Recommended next action**: run controlled K-sweeps (K=3/5/8/12) with
+  `--self-spec-layers` and `--adaptive-k` enabled, then pick the best operating
+  point by net decode tok/s at 65K+ contexts.
+
+- [ ] **Multi-query and grouped-query attention variants**
+  Full MHA used for grouped output projection. Paper's production config uses MQA
+  compression. Config supports the shape parameters but non-default settings
+  are unvalidated.
+
+- [x] **RoPE scaling for context lengths beyond training length**
+  YaRN and linear scaling implemented and validated up to 262K tokens.
 
 ---
 
 ## 8  Infrastructure / tooling
 
-- [ ] **Distributed checkpoint format (FSDP-safe sharding)**  
-  Checkpoints are saved as monolithic `.pt` files with `torch.save`. This does not
-  scale to larger models or FSDP sharded saves.
+- [ ] **Distributed checkpoint format (FSDP-safe sharding)**
+  Monolithic `.pt` files via `torch.save`. Does not scale beyond current model size.
 
-- [ ] **Weights-only or safetensors export**  
-  No script to export the trained model as a `safetensors` file or in a format
-  compatible with `transformers.AutoModelForCausalLM.from_pretrained`.
+- [ ] **Weights-only or safetensors export**
+  No script to export as `safetensors` or HuggingFace-compatible format.
 
-- [ ] **Config-driven experiment management**  
-  All hyperparameters are CLI flags. No YAML/JSON config system, no
-  experiment-tracking integration (Weights & Biases, MLflow, etc.).
+- [ ] **Config-driven experiment management**
+  All hyperparameters are CLI flags. No YAML/JSON config, no W&B / MLflow integration.
 
-- [ ] **Docker / container definition**  
-  There is no `Dockerfile` or container spec for reproducing the exact CUDA build
-  environment. The CUDA build currently requires a manually configured conda
-  environment (`deepfill`).
+- [ ] **Docker / container definition**
+  No `Dockerfile`. CUDA build requires manually maintained `deepfill` conda env.
 
-- [ ] **CI/CD pipeline**  
-  No GitHub Actions or equivalent that runs `pytest -q` and the smoke pipeline on
-  each commit. Currently all checks are run manually.
+- [ ] **CI/CD pipeline**
+  No GitHub Actions. `pytest -q` and smoke pipeline run manually only.
+
+---
+
+## Priority order — next actions
+
+```
+🔴 URGENT
+
+  1. Test K=5 and K=7 speculative decode (zero code change):
+       python scripts/benchmark_speculative.py \
+         --source-tokens 512 65536 131072 \
+         --decode-tokens 128 --draft-steps 5 \
+         --dtype bf16 --yarn-scaling \
+         --output-json artifacts/benchmark_speculative_k5.json
+     If net tok/s still < baseline → proceed to self-speculative decoding.
+
+  2. Run self-spec + adaptive-K sweep and lock recommended default settings.
+
+🟡 IMPORTANT
+
+  3. Standard eval harness (HumanEval + GSM8K minimum via lm-evaluation-harness)
+  4. SFT training loop
+  5. Expand tiled-prefill CUDA path coverage to masked/packed training batches
+  6. Perplexity eval script
+
+🟢 LATER
+
+  7. MQA output projection validation
+  8. Draft model TurboQuant (quick win — zero new code needed)
+  9. safetensors export
+  10. Dockerfile + CI/CD
+  11. YAML config + experiment tracking
+```

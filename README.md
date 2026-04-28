@@ -92,6 +92,9 @@ print(f"Effective speedup: {summary.effective_speedup:.1f}×")
 ```
 
 The decoder validates that target and draft vocab sizes match before decoding.
+It now also supports adaptive draft-step control during generation rounds and
+shared-layer self-spec drafts (first N target layers reused as the draft model)
+through the benchmark harness.
 For real draft benchmarks, use `scripts/benchmark_speculative.py`:
 
 ```bash
@@ -101,7 +104,33 @@ python scripts/benchmark_speculative.py \
     --source-tokens 65536 131072 262144 \
     --yarn-scaling \
     --output-json /tmp/spec_bench.json
+
+# Self-spec draft (shared first N target layers) + adaptive K
+python scripts/benchmark_speculative.py \
+    --target-model 2b \
+    --draft-model tiny \
+    --self-spec-layers 8 \
+    --adaptive-k \
+    --min-draft-steps 3 \
+    --max-draft-steps 8 \
+    --source-tokens 512 8192 65536 \
+    --dtype bf16 \
+    --device cuda \
+    --yarn-scaling \
+    --output-json /tmp/spec_bench_selfspec.json
 ```
+
+**Measured speculative decoding** (target=2B, draft=tiny, K=3, bf16, YaRN, RTX 4090):
+
+| ctx_len | baseline tok/s | speculative tok/s | acceptance rate | target peak MiB | draft peak MiB |
+|---------|----------------|-------------------|-----------------|-----------------|----------------|
+| 512     | 10.90          | 9.36              | 96.97%          | 3 818           | 3 777          |
+| 8 192   | 10.77          | 9.34              | 96.97%          | 4 318           | 3 874          |
+| 65 536  | 10.74          | 9.14              | 96.97%          | 7 780           | 4 597          |
+| 131 072 | 10.80          | 9.33              | 96.97%          | 11 791          | 5 423          |
+| 262 144 | 10.99          | 9.15              | 96.97%          | 19 757          | 7 075          |
+
+Raw result JSON: `artifacts/benchmark_speculative_k3.json`.
 
 ---
 
@@ -123,6 +152,10 @@ by this repo:
 - CSA lightning indexer kernel
 - HCA compression kernel
 - lazy build/load path via `deepseek_kernels/loader.py`
+
+Training-mode forward now has an opt-in tiled-prefill CUDA path in
+`deepseek_v4_pro_2b/modeling.py` for HCA/CSA attention when running on CUDA
+without an attention mask (`use_tiled_prefill_cuda=True` on config).
 
 Validation and benchmark commands:
 

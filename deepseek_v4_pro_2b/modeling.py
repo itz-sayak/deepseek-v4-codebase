@@ -13,6 +13,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover - keeps static tooling us
 
 from .configuration import DeepSeekV4Pro2BConfig
 
+try:
+    from deepseek_kernels.loader import cuda_extension_unavailable_reason
+    from deepseek_kernels.sparse_attention import tiled_prefill_attention
+except Exception:  # pragma: no cover - kernels are optional.
+    cuda_extension_unavailable_reason = None
+    tiled_prefill_attention = None
+
 
 @dataclass
 class DeepSeekV4Output:
@@ -100,6 +107,16 @@ def rope_attention_scale(config: DeepSeekV4Pro2BConfig) -> float:
     if scaling_factor <= 1.0:
         return 1.0
     return 1.0 + math.log(scaling_factor) * float(config.yarn_mscale)
+
+
+def _tiled_prefill_enabled(config: DeepSeekV4Pro2BConfig, device: torch.device) -> bool:
+    if not config.use_tiled_prefill_cuda:
+        return False
+    if device.type != "cuda":
+        return False
+    if tiled_prefill_attention is None or cuda_extension_unavailable_reason is None:
+        return False
+    return cuda_extension_unavailable_reason(require_device=True) is None
 
 
 def apply_rope(
@@ -272,7 +289,56 @@ class HCAAttention(CompressedAttentionBase):
     # for long contexts by avoiding materialising [B, T, H, nb] all at once.
     _PREFILL_CHUNK: int = 256
 
+    def _forward_tiled_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """CUDA-kernel prefill path for training-mode forward (no attention mask).
+
+        This path integrates the tiled prefill kernel into model.forward/chunked_forward.
+        It preserves exact semantics by building per-token source KV sets with:
+        - causal compressed blocks [0, t//M)
+        - causal sliding-window entries [max(0, t-W+1), t]
+        """
+        q, _ = self._queries(hidden_states)            # [B, T, H, D]
+        comp, _ = self._compress(hidden_states)        # [B, nb, D]
+        window = self._window_entries(hidden_states)   # [B, T, D]
+
+        B, T, _, D = q.shape
+        M = self.config.hca_compression
+        W = self.config.sliding_window
+        nb = comp.size(1)
+        scale = D ** -0.5
+        tile_size = int(self.config.tiled_prefill_tile_size)
+
+        outs: List[torch.Tensor] = []
+        for t in range(T):
+            g = min(nb, t // M)
+            w_start = max(0, t - W + 1)
+            win_t = window[:, w_start : t + 1]  # [B, w, D]
+            if g > 0:
+                src = torch.cat([comp[:, :g], win_t], dim=1)  # [B, g+w, D]
+            else:
+                src = win_t
+            kv = torch.stack([src, src], dim=2)  # [B, S, 2, D]
+            out_t = tiled_prefill_attention(
+                q[:, t : t + 1],
+                kv,
+                self.sink,
+                scale,
+                tile_size=tile_size,
+            )
+            out_t = apply_rope(
+                out_t,
+                torch.tensor([-t], device=hidden_states.device, dtype=torch.long),
+                self.config.rope_dim,
+                self.config.rope_theta,
+                config=self.config,
+            )
+            outs.append(out_t)
+        return self.output(torch.cat(outs, dim=1))
+
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if attention_mask is None and _tiled_prefill_enabled(self.config, hidden_states.device):
+            return self._forward_tiled_prefill(hidden_states)
+
         q, _ = self._queries(hidden_states)            # [B, T, H, D]
         comp, _ = self._compress(hidden_states)        # [B, nb, D]
         window = self._window_entries(hidden_states)   # [B, T, D]
@@ -422,7 +488,65 @@ class CSAAttention(CompressedAttentionBase):
 
     _PREFILL_CHUNK: int = 256
 
+    def _forward_tiled_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """CUDA-kernel prefill path for training-mode forward (no attention mask)."""
+        q, latent = self._queries(hidden_states)          # [B, T, H, D]
+        comp = self._compress_main(hidden_states)         # [B, nb, D]
+        index_keys = self._compress_index(hidden_states)  # [B, nb, IC]
+        index_q = self.index_q_up(latent).view(
+            hidden_states.size(0), hidden_states.size(1),
+            self.config.indexer_num_heads, self.config.indexer_head_dim,
+        )
+        index_w = self.index_weight(hidden_states)
+        window = self._window_entries(hidden_states)
+
+        B, T, _, D = q.shape
+        M = self.config.csa_compression
+        W = self.config.sliding_window
+        nb = comp.size(1)
+        K_cfg = min(self.config.csa_top_k, nb) if nb > 0 else 0
+        scale = D ** -0.5 * rope_attention_scale(self.config)
+        tile_size = int(self.config.tiled_prefill_tile_size)
+
+        outs: List[torch.Tensor] = []
+        b_index = torch.arange(B, device=hidden_states.device)
+        for t in range(T):
+            g = min(nb, t // M)
+            if g > 0 and K_cfg > 0:
+                s = torch.einsum("bic,bsc->bis", index_q[:, t], index_keys[:, :g])
+                s = (F.relu(s) * index_w[:, t].unsqueeze(-1)).sum(dim=1)  # [B, g]
+                k_eff = min(K_cfg, g)
+                topk = torch.topk(s, k=k_eff, dim=-1).indices  # [B, k_eff]
+                sel = comp[b_index[:, None], topk]  # [B, k_eff, D]
+            else:
+                sel = comp.new_empty(B, 0, D)
+
+            w_start = max(0, t - W + 1)
+            win_t = window[:, w_start : t + 1]  # [B, w, D]
+            src = torch.cat([sel, win_t], dim=1)
+            kv = torch.stack([src, src], dim=2)  # [B, S, 2, D]
+            out_t = tiled_prefill_attention(
+                q[:, t : t + 1],
+                kv,
+                self.sink,
+                scale,
+                tile_size=tile_size,
+            )
+            out_t = apply_rope(
+                out_t,
+                torch.tensor([-t], device=hidden_states.device, dtype=torch.long),
+                self.config.rope_dim,
+                self.config.rope_theta,
+                config=self.config,
+            )
+            outs.append(out_t)
+
+        return self.output(torch.cat(outs, dim=1))
+
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if attention_mask is None and _tiled_prefill_enabled(self.config, hidden_states.device):
+            return self._forward_tiled_prefill(hidden_states)
+
         q, latent = self._queries(hidden_states)          # [B, T, H, D]
         comp = self._compress_main(hidden_states)         # [B, nb, D]
         index_keys = self._compress_index(hidden_states)  # [B, nb, IC]

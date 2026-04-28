@@ -51,7 +51,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+from .configuration import DeepSeekV4Pro2BConfig
+from .modeling import DeepSeekV4Pro2BForCausalLM
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +130,11 @@ class SpeculativeDecoder:
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
+        adaptive_draft_steps: bool = False,
+        min_draft_steps: int = 1,
+        max_draft_steps: Optional[int] = None,
+        adapt_up_threshold: float = 0.90,
+        adapt_down_threshold: float = 0.60,
     ) -> None:
         target_vocab = target_engine.model.config.vocab_size
         draft_vocab = draft_engine.model.config.vocab_size
@@ -139,6 +148,13 @@ class SpeculativeDecoder:
         self.temperature = temperature
         self.top_k = top_k
         self._self_spec = target_engine is draft_engine
+        self.adaptive_draft_steps = adaptive_draft_steps
+        self.min_draft_steps = max(1, int(min_draft_steps))
+        self.max_draft_steps = max_draft_steps if max_draft_steps is not None else int(draft_steps)
+        self.adapt_up_threshold = float(adapt_up_threshold)
+        self.adapt_down_threshold = float(adapt_down_threshold)
+        if self.max_draft_steps < self.min_draft_steps:
+            self.max_draft_steps = self.min_draft_steps
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -372,8 +388,48 @@ class SpeculativeDecoder:
             summary.total_accepted += len(result.accepted_tokens)
             summary.total_rounds += 1
 
+            if self.adaptive_draft_steps:
+                if result.acceptance_rate >= self.adapt_up_threshold and self.draft_steps < self.max_draft_steps:
+                    self.draft_steps += 1
+                elif result.acceptance_rate <= self.adapt_down_threshold and self.draft_steps > self.min_draft_steps:
+                    self.draft_steps -= 1
+
             if eos_token_id is not None and last_token == eos_token_id:
                 break
 
         summary.output_ids = output_ids
         return summary
+
+
+def build_self_spec_draft_model(
+    target_model: DeepSeekV4Pro2BForCausalLM,
+    draft_layers: int,
+) -> DeepSeekV4Pro2BForCausalLM:
+    """Build a self-spec draft model by sharing the first N layers with target.
+
+    The draft model keeps the same tokenizer/vocab/head but executes fewer layers,
+    which removes duplicate model-weight residency and typically lowers draft-step
+    latency versus a separate tiny model.
+    """
+    total_layers = target_model.config.num_hidden_layers
+    if draft_layers <= 0 or draft_layers >= total_layers:
+        raise ValueError(
+            f"draft_layers must be in [1, {total_layers - 1}], got {draft_layers}"
+        )
+
+    cfg_dict = target_model.config.to_dict()
+    cfg_dict["num_hidden_layers"] = int(draft_layers)
+    draft_cfg = DeepSeekV4Pro2BConfig.from_dict(cfg_dict)
+    draft_model = DeepSeekV4Pro2BForCausalLM(draft_cfg)
+
+    # Share modules to avoid duplicating weights in HBM.
+    draft_model.model.embed_tokens = target_model.model.embed_tokens
+    draft_model.model.layers = nn.ModuleList(
+        [target_model.model.layers[i] for i in range(draft_layers)]
+    )
+    draft_model.model.final_norm = target_model.model.final_norm
+    draft_model.model.post = target_model.model.post
+    draft_model.lm_head = target_model.lm_head
+    draft_model.mtp_heads = nn.ModuleList()
+    draft_model.eval()
+    return draft_model

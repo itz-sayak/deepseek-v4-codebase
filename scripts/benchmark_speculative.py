@@ -31,7 +31,11 @@ if str(ROOT) not in sys.path:
 
 import torch
 
-from deepseek_v4_pro_2b import DeepSeekV4Pro2BConfig, DeepSeekV4Pro2BForCausalLM
+from deepseek_v4_pro_2b import (
+    DeepSeekV4Pro2BConfig,
+    DeepSeekV4Pro2BForCausalLM,
+    build_self_spec_draft_model,
+)
 from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
 from deepseek_v4_pro_2b.speculative import SpeculativeDecoder, SpecDecodeSummary
 from deepseek_pipeline.serving import CudaSparseAttentionBackend, PytorchAttentionBackend
@@ -292,6 +296,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark speculative decoding speedup")
     parser.add_argument("--target-model", choices=["2b", "tiny"], default="2b")
     parser.add_argument("--draft-model", choices=["tiny", "self"], default="tiny")
+    parser.add_argument(
+        "--self-spec-layers",
+        type=int,
+        default=None,
+        help="If set, build a shared-layer self-spec draft from the first N target layers",
+    )
     parser.add_argument("--source-tokens", type=int, nargs="+", default=[65536, 131072, 262144])
     parser.add_argument("--decode-tokens", type=int, default=128)
     parser.add_argument("--draft-steps", type=int, default=5)
@@ -302,6 +312,11 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default=None)
     parser.add_argument("--yarn-scaling", action="store_true", help="Enable YaRN RoPE scaling for target and draft models")
+    parser.add_argument("--adaptive-k", action="store_true", help="Enable adaptive draft-step control during generation rounds")
+    parser.add_argument("--min-draft-steps", type=int, default=1)
+    parser.add_argument("--max-draft-steps", type=int, default=None)
+    parser.add_argument("--adapt-up-threshold", type=float, default=0.90)
+    parser.add_argument("--adapt-down-threshold", type=float, default=0.60)
     parser.add_argument("--gpu-budget-gib", type=float, default=48.0)
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
@@ -325,12 +340,24 @@ def main() -> None:
     target_model = DeepSeekV4Pro2BForCausalLM(target_cfg).eval().to(device=device, dtype=dtype)
     if args.draft_model == "self":
         draft_model = target_model
+    elif args.self_spec_layers is not None:
+        draft_model = build_self_spec_draft_model(target_model, args.self_spec_layers).to(device=device, dtype=dtype)
     else:
         draft_model = DeepSeekV4Pro2BForCausalLM(draft_cfg).eval().to(device=device, dtype=dtype)
 
     target_engine = DeepSeekV4Pro2BServingEngine(target_model, backend=backend, device=device.type)
     draft_engine = target_engine if args.draft_model == "self" else DeepSeekV4Pro2BServingEngine(draft_model, backend=backend, device=device.type)
-    decoder = SpeculativeDecoder(target_engine, draft_engine, draft_steps=args.draft_steps, temperature=0.0)
+    decoder = SpeculativeDecoder(
+        target_engine,
+        draft_engine,
+        draft_steps=args.draft_steps,
+        temperature=0.0,
+        adaptive_draft_steps=args.adaptive_k,
+        min_draft_steps=args.min_draft_steps,
+        max_draft_steps=args.max_draft_steps,
+        adapt_up_threshold=args.adapt_up_threshold,
+        adapt_down_threshold=args.adapt_down_threshold,
+    )
 
     budget_cap_context = 2 * target_cfg.max_position_embeddings
     effective_source_tokens = list(args.source_tokens)
@@ -411,6 +438,13 @@ def main() -> None:
         "dtype": str(dtype).replace("torch.", ""),
         "target_model": args.target_model,
         "draft_model": args.draft_model,
+        "self_spec_layers": args.self_spec_layers,
+        "adaptive_k": args.adaptive_k,
+        "min_draft_steps": args.min_draft_steps,
+        "max_draft_steps": args.max_draft_steps,
+        "adapt_up_threshold": args.adapt_up_threshold,
+        "adapt_down_threshold": args.adapt_down_threshold,
+        "draft_steps": args.draft_steps,
         "rope_scaling": "yarn" if args.yarn_scaling else "none",
         "rope_scaling_factor": rope_scaling_factor if args.yarn_scaling else 1.0,
         "budget_gib": args.gpu_budget_gib,

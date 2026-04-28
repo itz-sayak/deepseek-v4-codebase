@@ -33,6 +33,8 @@ class DeepSeekV4Pro2BConfig:
     yarn_beta_fast: float = 32.0
     yarn_beta_slow: float = 1.0
     yarn_mscale: float = 0.1
+    use_tiled_prefill_cuda: bool = False
+    tiled_prefill_tile_size: int = 256
     output_groups: int = 4
     group_output_dim: int = 384
     num_routed_experts: int = 16

@@ -1,0 +1,172 @@
+{
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "target_model": "2b",
+  "draft_model": "tiny",
+  "rope_scaling": "yarn",
+  "rope_scaling_factor": 4.0,
+  "budget_gib": 48.0,
+  "budget_cap_context": 131072,
+  "budget_estimate_mib": {
+    "target_peak_mib": 19750.59375,
+    "draft_peak_mib": 4908.103515625,
+    "combined_peak_mib": 24658.697265625
+  },
+  "budget_capped": false,
+  "source_tokens": [
+    512,
+    8192,
+    65536,
+    131072,
+    262144
+  ],
+  "effective_source_tokens": [
+    512,
+    8192,
+    65536,
+    131072,
+    262144
+  ],
+  "results": [
+    {
+      "requested_source_tokens": 512,
+      "effective_source_tokens": 512,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 0.5881883106194437,
+        "draft_time_s": 0.06896041100844741,
+        "target_peak_mib": 3905.8720703125,
+        "draft_peak_mib": 3864.5205078125
+      },
+      "baseline_decode": {
+        "mean_s": 11.745606177020818,
+        "std_s": 0.047139268743296436,
+        "mean_tok_s": 10.897692130221431,
+        "generated_tokens": 128,
+        "rounds": 10
+      },
+      "speculative_decode": {
+        "mean_s": 13.95124997147359,
+        "std_s": 0.1260863714970286,
+        "mean_tok_s": 9.174805143748713,
+        "mean_acceptance_rate": 0.954954954954955,
+        "total_proposed_mean": 111,
+        "total_accepted_mean": 106,
+        "rounds": 10,
+        "matches_target_greedy": true
+      }
+    },
+    {
+      "requested_source_tokens": 8192,
+      "effective_source_tokens": 8192,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 5.578816624823958,
+        "draft_time_s": 0.8630741429515183,
+        "target_peak_mib": 4460.583984375,
+        "draft_peak_mib": 3963.3125
+      },
+      "baseline_decode": {
+        "mean_s": 11.788502970524132,
+        "std_s": 0.1397112323795122,
+        "mean_tok_s": 10.858036878817444,
+        "generated_tokens": 128,
+        "rounds": 10
+      },
+      "speculative_decode": {
+        "mean_s": 13.910360033111647,
+        "std_s": 0.08495258153024143,
+        "mean_tok_s": 9.201774770409543,
+        "mean_acceptance_rate": 0.954954954954955,
+        "total_proposed_mean": 111,
+        "total_accepted_mean": 106,
+        "rounds": 10,
+        "matches_target_greedy": true
+      }
+    },
+    {
+      "requested_source_tokens": 65536,
+      "effective_source_tokens": 65536,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 46.49421012122184,
+        "draft_time_s": 6.850189907941967,
+        "target_peak_mib": 7922.1953125,
+        "draft_peak_mib": 4685.919921875
+      },
+      "baseline_decode": {
+        "mean_s": 11.58835142571479,
+        "std_s": 0.07795139729285691,
+        "mean_tok_s": 11.04557458586951,
+        "generated_tokens": 128,
+        "rounds": 10
+      },
+      "speculative_decode": {
+        "mean_s": 14.029683714732528,
+        "std_s": 0.15849391315696962,
+        "mean_tok_s": 9.123512874747675,
+        "mean_acceptance_rate": 0.954954954954955,
+        "total_proposed_mean": 111,
+        "total_accepted_mean": 106,
+        "rounds": 10,
+        "matches_target_greedy": true
+      }
+    },
+    {
+      "requested_source_tokens": 131072,
+      "effective_source_tokens": 131072,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 99.45096594188362,
+        "draft_time_s": 15.272396123036742,
+        "target_peak_mib": 11932.3515625,
+        "draft_peak_mib": 5511.13037109375
+      },
+      "baseline_decode": {
+        "mean_s": 11.841577341919765,
+        "std_s": 0.04397653232815889,
+        "mean_tok_s": 10.809370770807172,
+        "generated_tokens": 128,
+        "rounds": 10
+      },
+      "speculative_decode": {
+        "mean_s": 14.003407584270462,
+        "std_s": 0.10805071624104323,
+        "mean_tok_s": 9.140632323219522,
+        "mean_acceptance_rate": 0.954954954954955,
+        "total_proposed_mean": 111,
+        "total_accepted_mean": 106,
+        "rounds": 10,
+        "matches_target_greedy": true
+      }
+    },
+    {
+      "requested_source_tokens": 262144,
+      "effective_source_tokens": 262144,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 225.04357922496274,
+        "draft_time_s": 36.17643350502476,
+        "target_peak_mib": 19899.24169921875,
+        "draft_peak_mib": 7163.42333984375
+      },
+      "baseline_decode": {
+        "mean_s": 11.927593672182411,
+        "std_s": 0.02205867001182989,
+        "mean_tok_s": 10.731418550794716,
+        "generated_tokens": 128,
+        "rounds": 10
+      },
+      "speculative_decode": {
+        "mean_s": 13.919868880556896,
+        "std_s": 0.08339954212418084,
+        "mean_tok_s": 9.195488915760468,
+        "mean_acceptance_rate": 0.954954954954955,
+        "total_proposed_mean": 111,
+        "total_accepted_mean": 106,
+        "rounds": 10,
+        "matches_target_greedy": true
+      }
+    }
+  ]
+}
