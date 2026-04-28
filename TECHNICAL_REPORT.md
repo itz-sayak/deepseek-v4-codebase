@@ -367,13 +367,15 @@ quantised decoding — this is expected, not a bug).
 | 256 | 8    | ≈ 0.000000    | 100%        | 0.0018         | ✅ PASS |
 | 256 | 4    | 0.000728      | 100%        | 0.1141         | ✅ PASS |
 
-Additional GPU YaRN validation (`deepfill`, RTX 4090, `--turbo-quant-bits 4`, `--rope-scaling yarn`, `--device cuda`):
+Additional GPU YaRN validation (`deepfill`, RTX 4090, `--turbo-quant-bits 4`, `--rope-scaling yarn`, `--device cuda`, `chunked_fast_prefill` for ctx ≥ 16K):
 
-| ctx  | bits | KL vs baseline | top-1 match | max logit diff | verdict |
-|------|------|----------------|-------------|----------------|---------|
-| 2048 | 4    | 0.000008       | 100%        | 0.0131         | ✅ PASS |
-| 4096 | 4    | 0.000005       | 100%        | 0.0083         | ✅ PASS |
-| 8192 | 4    | 0.000006       | 100%        | 0.0094         | ✅ PASS |
+| ctx    | bits | KL vs baseline | top-1 match | max logit diff | prefill time | verdict |
+|--------|------|----------------|-------------|----------------|--------------|---------|
+| 2048   | 4    | 0.000008       | 100%        | 0.0131         | 26.0s        | ✅ PASS |
+| 4096   | 4    | 0.000005       | 100%        | 0.0083         | 51.0s        | ✅ PASS |
+| 8192   | 4    | 0.000006       | 100%        | 0.0094         | 104.4s       | ✅ PASS |
+| 131072 | 4    | 0.000004       | 100%        | 0.0078         | 15.2s        | ✅ PASS |
+| 262144 | 4    | 0.000005       | 100%        | 0.0078         | 35.9s        | ✅ PASS |
 
 **Memory reduction (decode)**: At 262K tokens, 128 HCA layers, D=1536:
 - bf16 compressed cache: 262144 × 1536 × 2B = **768 MiB** per layer
@@ -447,10 +449,10 @@ schedule used during prefill, incremental decode, and the new needle diagnostic.
 
 ```bash
 pytest -q tests/test_rope_scaling.py
-python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 131072 262144 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
 ```
 
-All measured YaRN GPU runs passed the logit-based quality gate (top-1 match true at every tested context length).
+All measured YaRN GPU runs passed the logit-based quality gate (top-1 match true at every tested context length up to 262K).
 
 ---
 

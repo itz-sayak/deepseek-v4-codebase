@@ -236,10 +236,15 @@ These are the hardest items and block 1M-token throughput measurement.
   Results (CPU tiny model, ctx=64/128/256):  
   - 8-bit: KL ≈ 0, max_logit_diff ≈ 0.002, top-1 match 100% — **near-lossless**  
   - 4-bit: KL < 0.001, max_logit_diff < 0.12, top-1 match 100% — **production-safe**  
-  Results (GPU, YaRN, ctx=2048/4096/8192, 4-bit):
-  - KL: 0.000008 / 0.000005 / 0.000006
-  - top-1 match: True / True / True
-  - max_logit_diff: 0.0131 / 0.0083 / 0.0094
+  Results (GPU, YaRN, deepfill / RTX 4090, chunked_fast_prefill for ctx ≥ 16K):
+
+  | ctx    | bits | KL div   | top-1 | max diff |
+  |--------|------|----------|-------|----------|
+  | 2048   | 4    | 0.000008 | True  | 0.0131   |
+  | 4096   | 4    | 0.000005 | True  | 0.0083   |
+  | 8192   | 4    | 0.000006 | True  | 0.0094   |
+  | 131072 | 4    | 0.000004 | True  | 0.0078   |
+  | 262144 | 4    | 0.000005 | True  | 0.0078   |
   Results saved to `artifacts/needle_eval_results.json`.
 
 - [ ] **Standard benchmark evaluations**  

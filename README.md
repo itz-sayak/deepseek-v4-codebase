@@ -31,7 +31,8 @@ engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=4)   # 4-bit (4× 
 **Quality gate** (needle-in-haystack eval across CPU and GPU contexts):
 - 8-bit: KL ≈ 0 vs baseline, 100% top-1 match — **near-lossless**
 - 4-bit: KL < 0.001, 100% top-1 match — **production-safe**
-- Latest GPU YaRN run (`ctx=2048/4096/8192`, 4-bit): KL = `8e-6/5e-6/6e-6`, top-1 = `True/True/True`
+- GPU YaRN run (`ctx=2048/4096/8192`, 4-bit, RTX 4090): KL = `8e-6/5e-6/6e-6`, top-1 = `True/True/True`
+- GPU YaRN run (`ctx=131072/262144`, 4-bit, RTX 4090): KL = `4e-6/5e-6`, top-1 = `True/True` — **✅ ALL QUALITY GATES PASSED**
 
 ```bash
 # Run the full quality gate eval
@@ -67,7 +68,7 @@ applies the YaRN logit correction in HCA/CSA attention.
 
 ```bash
 # Long-context needle diagnostic with YaRN enabled
-python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 131072 262144 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
 ```
 
 ### Speculative Decoding

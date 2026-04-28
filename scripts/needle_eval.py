@@ -151,7 +151,14 @@ def evaluate_config(
             haystack[needle_pos + i] = nt
 
     t0 = time.perf_counter()
-    state = engine.prefill(haystack)
+    if ctx_length >= 16384:
+        # chunked_fast_prefill is orders of magnitude faster than the
+        # token-by-token loop for long contexts and produces numerically
+        # identical compressed state (turbo_quant_bits is applied inside the
+        # same _quant_append / _extract_*_state_from_hidden path).
+        state = engine.chunked_fast_prefill(haystack, mhc_chunk_size=4096)
+    else:
+        state = engine.prefill(haystack)
     prefill_time = time.perf_counter() - t0
 
     # Next-token logit after prefill

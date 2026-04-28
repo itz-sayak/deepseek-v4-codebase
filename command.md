@@ -118,7 +118,7 @@ pytest -q tests/test_chunked_prefill.py
 pytest -q tests/test_rope_scaling.py
 pytest -q tests/test_speculative.py
 python scripts/needle_eval.py --ctx-lengths 64 128 256 512
-python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 131072 262144 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
 ```
 
 ## 10) Optional: Speculative Decoding Benchmark
