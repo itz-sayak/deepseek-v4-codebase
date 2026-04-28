@@ -82,8 +82,8 @@ def test_polar_quant_8bit_roundtrip(d):
 
     # data must be int8
     assert data.dtype == torch.int8, f"Expected int8, got {data.dtype}"
-    # scale must be float16
-    assert scale.dtype == torch.float16, f"Expected float16 scale, got {scale.dtype}"
+    # scale must be float32
+    assert scale.dtype == torch.float32, f"Expected float32 scale, got {scale.dtype}"
     # scale shape: [..., 1]
     assert scale.shape == (1, 64, 1)
     # data shape: same as x for 8-bit
@@ -108,7 +108,7 @@ def test_polar_quant_4bit_roundtrip(d):
     # data must be uint8, D//2 per vector (packed)
     assert data.dtype == torch.uint8, f"Expected uint8, got {data.dtype}"
     assert data.shape == (1, 64, d // 2), f"Expected packed shape {(1, 64, d//2)}, got {data.shape}"
-    assert scale.dtype == torch.float16
+    assert scale.dtype == torch.float32
     assert scale.shape == (1, 64, 1)
 
     x_hat = pq.decode(data, scale)
@@ -232,7 +232,7 @@ def test_serving_engine_no_quant_is_noop():
 
 
 def test_serving_engine_8bit_quant_produces_int8():
-    """With turbo_quant_bits=8, _quant_append produces int8 data + float16 scale."""
+    """With turbo_quant_bits=8, _quant_append produces int8 data + float32 scale."""
     from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
     from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
     from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
@@ -257,7 +257,7 @@ def test_serving_engine_8bit_quant_produces_int8():
     dummy = torch.randn(1, 4, 16, dtype=torch.bfloat16)
     data, scale = engine._quant_append(None, None, dummy)
     assert data.dtype == torch.int8
-    assert scale is not None and scale.dtype == torch.float16
+    assert scale is not None and scale.dtype == torch.float32
 
     # Read back should give bf16.
     recovered = engine._read_compressed(data, scale)

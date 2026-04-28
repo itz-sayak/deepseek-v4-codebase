@@ -32,7 +32,7 @@ Decode: x' = D * WHT(y')          -- because WHT^{-1} = WHT for the normalised f
 Usage
 -----
 >>> pq = PolarQuant(bits=8)
->>> data, scale = pq.encode(compressed_bf16)  # [B, T, D] -> int8 + float16 scale
+>>> data, scale = pq.encode(compressed_bf16)  # [B, T, D] -> int8 + float32 scale
 >>> approx = pq.decode(data, scale)            # -> bf16, shape [B, T, D]
 """
 from __future__ import annotations
@@ -137,7 +137,7 @@ class PolarQuant:
         -------
         data : Tensor [..., D] int8   (bits=8)
                Tensor [..., D//2] uint8  (bits=4, packed)
-        scale : Tensor [..., 1] float16  — per-vector symmetric scale
+        scale : Tensor [..., 1] float32  — per-vector symmetric scale
         """
         d = x.shape[-1]
         device = x.device
@@ -149,13 +149,13 @@ class PolarQuant:
 
         if self.bits == 8:
             max_abs = rotated.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-8)
-            scale = (max_abs / 127.0).to(torch.float16)
-            data = (rotated / max_abs * 127.0).round_().clamp_(-128, 127).to(torch.int8)
+            scale = max_abs / 127.0
+            data = (rotated / max_abs * 127.0).round_().clamp_(-127, 127).to(torch.int8)
             return data, scale
 
         # bits == 4: symmetric, range [-7, 7] (avoids -8 for a clean zero-point)
         max_abs = rotated.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-8)
-        scale = (max_abs / 7.0).to(torch.float16)
+        scale = max_abs / 7.0
         q = (rotated / max_abs * 7.0).round_().clamp_(-7, 7).to(torch.int32)
 
         # Pack pairs: even index → lower nibble, odd index → upper nibble.
@@ -176,7 +176,7 @@ class PolarQuant:
         Parameters
         ----------
         data : int8 tensor [..., D] or uint8 tensor [..., D//2] for 4-bit
-        scale : float16 tensor [..., 1]
+        scale : float32 tensor [..., 1]
         out_dtype : output dtype, default bfloat16
 
         Returns
