@@ -328,7 +328,7 @@ Serving-path benchmark results verified in this workspace:
 
 ---
 
-## April 2026 Sprint: TurboQuant, Prefill OOM Fix, Speculative Decoding
+## April 2026 Sprint: TurboQuant, Prefill OOM Fix, YaRN RoPE Scaling, Speculative Decoding
 
 ### 1. TurboQuant — PolarQuant (mHC KV-Cache Compression)
 
@@ -366,6 +366,14 @@ quantised decoding — this is expected, not a bug).
 | 128 | 4    | 0.000228      | 100%        | 0.0678         | ✅ PASS |
 | 256 | 8    | ≈ 0.000000    | 100%        | 0.0018         | ✅ PASS |
 | 256 | 4    | 0.000728      | 100%        | 0.1141         | ✅ PASS |
+
+Additional GPU YaRN validation (`deepfill`, RTX 4090, `--turbo-quant-bits 4`, `--rope-scaling yarn`, `--device cuda`):
+
+| ctx  | bits | KL vs baseline | top-1 match | max logit diff | verdict |
+|------|------|----------------|-------------|----------------|---------|
+| 2048 | 4    | 0.000008       | 100%        | 0.0131         | ✅ PASS |
+| 4096 | 4    | 0.000005       | 100%        | 0.0083         | ✅ PASS |
+| 8192 | 4    | 0.000006       | 100%        | 0.0094         | ✅ PASS |
 
 **Memory reduction (decode)**: At 262K tokens, 128 HCA layers, D=1536:
 - bf16 compressed cache: 262144 × 1536 × 2B = **768 MiB** per layer
@@ -418,7 +426,35 @@ state = engine.chunked_fast_prefill(token_ids, mhc_chunk_size=4096)
 
 ---
 
-### 3. Speculative Decoding
+### 3. YaRN RoPE Scaling
+
+**Files**: `deepseek_v4_pro_2b/configuration.py`, `deepseek_v4_pro_2b/modeling.py`, `deepseek_v4_pro_2b/serving.py`, `scripts/needle_eval.py`, `tests/test_rope_scaling.py`
+
+Adds config-driven long-context RoPE scaling with the same helper used in both
+prefill and serving decode paths:
+
+- `max_position_embeddings` is now the train-context reference on config
+- `rope_scaling_type ∈ {none, linear, yarn}` and `rope_scaling_factor` control
+  the schedule without hardcoding lengths in callsites
+- `get_rope_freqs(seq_len, config)` computes the frequency table, and
+  `rope_attention_scale(config)` applies the YaRN logit correction in HCA/CSA
+  attention paths
+
+This keeps the 262K+ long-context path numerically consistent with the same RoPE
+schedule used during prefill, incremental decode, and the new needle diagnostic.
+
+**Validation**:
+
+```bash
+pytest -q tests/test_rope_scaling.py
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
+```
+
+All measured YaRN GPU runs passed the logit-based quality gate (top-1 match true at every tested context length).
+
+---
+
+### 4. Speculative Decoding
 
 **File**: `deepseek_v4_pro_2b/speculative.py`
 
@@ -436,6 +472,7 @@ Implements standard draft-model speculative decoding (Chen et al., 2023,
 - Output distribution is **identical** to the target model alone (no quality loss)
 - With a perfect draft (draft == target, greedy): 100% acceptance rate
 - Fallback: `self._self_spec = True` → standard single-step decode (for correctness testing)
+- Target and draft vocab sizes are validated up front so mismatches fail fast instead of producing silent garbage logits
 
 **Expected throughput improvement**:
 At acceptance rate α = 0.8, K = 5 draft tokens:
@@ -460,7 +497,11 @@ print(f"Acceptance rate: {summary.mean_acceptance_rate:.2%}")
 print(f"Effective speedup: {summary.effective_speedup:.1f}×")
 ```
 
-**Tests**: 9 unit tests in `tests/test_speculative.py`.
+**Benchmark harness** (`scripts/benchmark_speculative.py`): greedy target-only vs
+speculative decode, with a separate tiny draft model that shares the target
+tokenizer vocab and optional YaRN scaling for long contexts.
+
+**Tests**: 11 unit tests in `tests/test_speculative.py`.
 
 ---
 
@@ -469,12 +510,15 @@ print(f"Effective speedup: {summary.effective_speedup:.1f}×")
 | File | Status | Description |
 |------|--------|-------------|
 | `deepseek_v4_pro_2b/turbo_quant.py` | Modified | WHT aliasing fix, `out_dtype` param on `decode()` |
-| `deepseek_v4_pro_2b/serving.py` | Modified | `_read_compressed` dtype fix, `chunked_fast_prefill()` |
-| `deepseek_v4_pro_2b/modeling.py` | Modified | `chunked_forward()` on mHC, Block, and Model |
+| `deepseek_v4_pro_2b/configuration.py` | Modified | Added `max_position_embeddings` and YaRN rope-scaling fields |
+| `deepseek_v4_pro_2b/modeling.py` | Modified | `chunked_forward()` on mHC, Block, and Model; shared RoPE helpers |
+| `deepseek_v4_pro_2b/serving.py` | Modified | `_read_compressed` dtype fix, `chunked_fast_prefill()`, YaRN decode scaling |
 | `deepseek_v4_pro_2b/speculative.py` | **New** | `SpeculativeDecoder`, `SpecDecodeResult`, `SpecDecodeSummary` |
 | `deepseek_v4_pro_2b/__init__.py` | Modified | `SpeculativeDecoder` exported |
-| `scripts/needle_eval.py` | **New** | Needle-in-haystack TurboQuant validation harness |
+| `scripts/needle_eval.py` | **New** | Needle-in-haystack TurboQuant / YaRN validation harness |
+| `scripts/benchmark_speculative.py` | **New** | Greedy target-only vs speculative decode benchmark harness |
 | `tests/test_turbo_quant.py` | Existing | 14 tests (all passing) |
 | `tests/test_chunked_prefill.py` | **New** | 9 tests for chunked mHC forward + `chunked_fast_prefill` |
-| `tests/test_speculative.py` | **New** | 9 tests for speculative decoding |
+| `tests/test_rope_scaling.py` | **New** | 5 tests for YaRN/linear RoPE scaling and model smoke coverage |
+| `tests/test_speculative.py` | **New** | 11 tests for speculative decoding |
 | `artifacts/needle_eval_results.json` | **New** | Quality gate results |

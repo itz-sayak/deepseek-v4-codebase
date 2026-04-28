@@ -127,6 +127,12 @@ class SpeculativeDecoder:
         top_k: Optional[int] = None,
         seed: Optional[int] = None,
     ) -> None:
+        target_vocab = target_engine.model.config.vocab_size
+        draft_vocab = draft_engine.model.config.vocab_size
+        if target_vocab != draft_vocab:
+            raise ValueError(
+                f"Speculative decoding requires matching vocab_size, got target={target_vocab} and draft={draft_vocab}"
+            )
         self.target = target_engine
         self.draft = draft_engine
         self.draft_steps = draft_steps

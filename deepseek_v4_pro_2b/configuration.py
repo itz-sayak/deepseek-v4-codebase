@@ -27,6 +27,12 @@ class DeepSeekV4Pro2BConfig:
     sliding_window: int = 128
     rope_dim: int = 64
     rope_theta: float = 10000.0
+    max_position_embeddings: int = 65536
+    rope_scaling_type: str = "none"
+    rope_scaling_factor: float = 1.0
+    yarn_beta_fast: float = 32.0
+    yarn_beta_slow: float = 1.0
+    yarn_mscale: float = 0.1
     output_groups: int = 4
     group_output_dim: int = 384
     num_routed_experts: int = 16

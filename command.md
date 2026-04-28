@@ -115,11 +115,24 @@ python scripts/benchmark_cuda_kernels.py --dtype fp16 --source-tokens 8192 --top
 pytest -q tests/test_incremental_serving.py
 pytest -q tests/test_turbo_quant.py
 pytest -q tests/test_chunked_prefill.py
+pytest -q tests/test_rope_scaling.py
 pytest -q tests/test_speculative.py
 python scripts/needle_eval.py --ctx-lengths 64 128 256 512
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
 ```
 
-## 10) Optional: End-to-End Serving Benchmark
+## 10) Optional: Speculative Decoding Benchmark
+
+```bash
+python scripts/benchmark_speculative.py \
+  --target-model 2b \
+  --draft-model tiny \
+  --source-tokens 65536 131072 262144 \
+  --yarn-scaling \
+  --output-json /tmp/spec_bench.json
+```
+
+## 11) Optional: End-to-End Serving Benchmark
 
 ```bash
 python scripts/benchmark_e2e_serving.py \

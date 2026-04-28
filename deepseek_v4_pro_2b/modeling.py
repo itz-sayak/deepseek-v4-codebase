@@ -50,15 +50,78 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-def apply_rope(x: torch.Tensor, positions: torch.Tensor, rope_dim: int, theta: float) -> torch.Tensor:
+def get_rope_freqs(seq_len: int, config: DeepSeekV4Pro2BConfig, device: Optional[torch.device] = None) -> torch.Tensor:
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    rope_dim = min(config.rope_dim, 1 << 30)
+    if rope_dim <= 0:
+        return torch.empty(0, device=device, dtype=torch.float32)
+    if rope_dim % 2:
+        rope_dim -= 1
+    if rope_dim <= 0:
+        return torch.empty(0, device=device, dtype=torch.float32)
+
+    half_dim = rope_dim // 2
+    freq_idx = torch.arange(half_dim, device=device, dtype=torch.float32)
+    base_freqs = 1.0 / (config.rope_theta ** (freq_idx / half_dim))
+
+    scaling_type = (config.rope_scaling_type or "none").lower()
+    scaling_factor = max(float(config.rope_scaling_factor), 1.0)
+    if scaling_type == "linear" and scaling_factor > 1.0:
+        return base_freqs / scaling_factor
+    if scaling_type != "yarn" or scaling_factor <= 1.0:
+        return base_freqs
+
+    train_ctx = max(float(config.max_position_embeddings), 1.0)
+    beta_fast = max(float(config.yarn_beta_fast), 1.0)
+    beta_slow = max(float(config.yarn_beta_slow), 1e-6)
+    short_wavelen = train_ctx / beta_fast
+    long_wavelen = train_ctx / beta_slow
+    wavelen = (2.0 * math.pi) / base_freqs.clamp_min(1e-12)
+    scaled_freqs = base_freqs / scaling_factor
+    keep_mask = wavelen <= short_wavelen
+    full_mask = wavelen >= long_wavelen
+    blend_mask = ~(keep_mask | full_mask)
+    if not blend_mask.any():
+        return torch.where(keep_mask, base_freqs, scaled_freqs)
+
+    freq_ratio = train_ctx / wavelen
+    denom = max(beta_fast - beta_slow, 1e-6)
+    ramp = ((freq_ratio - beta_slow) / denom).clamp(0.0, 1.0)
+    blended = scaled_freqs * (1.0 - ramp) + base_freqs * ramp
+    return torch.where(keep_mask, base_freqs, torch.where(full_mask, scaled_freqs, blended))
+
+
+def rope_attention_scale(config: DeepSeekV4Pro2BConfig) -> float:
+    scaling_type = (config.rope_scaling_type or "none").lower()
+    if scaling_type != "yarn":
+        return 1.0
+    scaling_factor = max(float(config.rope_scaling_factor), 1.0)
+    if scaling_factor <= 1.0:
+        return 1.0
+    return 1.0 + math.log(scaling_factor) * float(config.yarn_mscale)
+
+
+def apply_rope(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    theta: float,
+    config: Optional[DeepSeekV4Pro2BConfig] = None,
+) -> torch.Tensor:
     if rope_dim <= 0:
         return x
     rope_dim = min(rope_dim, x.size(-1))
     if rope_dim % 2:
         rope_dim -= 1
+    if rope_dim <= 0:
+        return x
     pass_part, rope_part = x[..., :-rope_dim], x[..., -rope_dim:]
-    freqs = torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32)
-    inv_freq = 1.0 / (theta ** (freqs / rope_dim))
+    if config is None:
+        freqs = torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32)
+        inv_freq = 1.0 / (theta ** (freqs / rope_dim))
+    else:
+        inv_freq = get_rope_freqs(max(positions.numel(), 1), config, device=x.device)[: rope_dim // 2]
     angles = positions.float().unsqueeze(-1) * inv_freq
     cos = torch.repeat_interleave(angles.cos(), 2, dim=-1).to(x.dtype)
     sin = torch.repeat_interleave(angles.sin(), 2, dim=-1).to(x.dtype)
@@ -83,8 +146,9 @@ def sink_attention(
     dropout_p: float,
     training: bool,
     kv_mask: Optional[torch.Tensor] = None,
+    logit_scale: float = 1.0,
 ) -> torch.Tensor:
-    scale = q.size(-1) ** -0.5
+    scale = q.size(-1) ** -0.5 * logit_scale
     logits = torch.einsum("bhd,bsd->bhs", q, k) * scale
     if kv_mask is not None:
         logits = logits.masked_fill(~kv_mask[:, None, :], float("-inf"))
@@ -151,13 +215,13 @@ class CompressedAttentionBase(nn.Module):
         bsz, seq_len, _ = q.shape
         q = q.view(bsz, seq_len, self.config.num_attention_heads, self.config.attention_head_dim)
         positions = torch.arange(seq_len, device=hidden_states.device)
-        q = apply_rope(q, positions, self.config.rope_dim, self.config.rope_theta)
+        q = apply_rope(q, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return self.q_norm(q), latent
 
     def _window_entries(self, hidden_states: torch.Tensor) -> torch.Tensor:
         positions = torch.arange(hidden_states.size(1), device=hidden_states.device)
         kv = self.window_kv(hidden_states)
-        kv = apply_rope(kv, positions, self.config.rope_dim, self.config.rope_theta)
+        kv = apply_rope(kv, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return self.kv_norm(kv)
 
     def _finish(self, q: torch.Tensor, kv_per_token: List[Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
@@ -174,9 +238,10 @@ class CompressedAttentionBase(nn.Module):
                 self.config.attention_dropout,
                 self.training,
                 kv_mask=kv_mask,
+                logit_scale=rope_attention_scale(self.config),
             )
             neg_pos = torch.full((q.size(0), q.size(2)), -t, device=q.device, dtype=torch.long)
-            out = apply_rope(out, neg_pos, self.config.rope_dim, self.config.rope_theta)
+            out = apply_rope(out, neg_pos, self.config.rope_dim, self.config.rope_theta, config=self.config)
             outs.append(out)
         return self.output(torch.stack(outs, dim=1))
 
@@ -342,7 +407,7 @@ class CSAAttention(CompressedAttentionBase):
             self.bias_b,
         )
         positions = torch.arange(comp.size(1), device=comp.device) * self.config.csa_compression
-        comp = apply_rope(comp, positions, self.config.rope_dim, self.config.rope_theta)
+        comp = apply_rope(comp, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return self.kv_norm(comp)
 
     def _compress_index(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -374,6 +439,7 @@ class CSAAttention(CompressedAttentionBase):
         W = self.config.sliding_window
         nb = comp.size(1)
         scale = D ** -0.5
+        rope_scale = rope_attention_scale(self.config)
         t_idx = torch.arange(T, device=hidden_states.device)
         w_idx = torch.arange(W, device=hidden_states.device)
 
@@ -418,14 +484,14 @@ class CSAAttention(CompressedAttentionBase):
                 b_arange = torch.arange(B, device=comp.device).view(B, 1, 1).expand(B, C, K)
                 sel_kv_ch = comp[b_arange, topk_ch]                       # [B, C, K, D]
 
-                g_logits = torch.einsum("bthd,btkd->bthk", q_ch, sel_kv_ch) * scale
+                g_logits = torch.einsum("bthd,btkd->bthk", q_ch, sel_kv_ch) * (scale * rope_scale)
                 g_logits = g_logits.masked_fill(~sel_mask_ch.unsqueeze(2), float("-inf"))
             else:
                 g_logits = q_ch.new_full((B, C, H, 0), float("-inf"))
                 sel_kv_ch = comp.new_empty(B, C, 0, D)
 
             # ── window logits ─────────────────────────────────────────────
-            w_logits = torch.einsum("bthd,btwd->bthw", q_ch, win_ch) * scale
+            w_logits = torch.einsum("bthd,btwd->bthw", q_ch, win_ch) * (scale * rope_scale)
             w_logits = w_logits.masked_fill(~win_mask_ch.unsqueeze(2), float("-inf"))
 
             # ── softmax with sink ─────────────────────────────────────────
@@ -439,7 +505,7 @@ class CSAAttention(CompressedAttentionBase):
             out_c = (torch.einsum("bthk,btkd->bthd", wts[:, :, :, :K], sel_kv_ch)
                      if K > 0 else q_ch.new_zeros(B, C, H, D))
             out_c = out_c + torch.einsum("bthw,btwd->bthd", wts[:, :, :, K:], win_ch)
-            out_c = apply_rope(out_c, -t_ch, self.config.rope_dim, self.config.rope_theta)
+            out_c = apply_rope(out_c, -t_ch, self.config.rope_dim, self.config.rope_theta, config=self.config)
             out_chunks.append(out_c)
 
         return self.output(torch.cat(out_chunks, dim=1))

@@ -17,7 +17,7 @@ from deepseek_pipeline.serving import (
 )
 
 from .configuration import DeepSeekV4Pro2BConfig
-from .modeling import CSAAttention, HCAAttention, DeepSeekV4Pro2BForCausalLM, apply_rope
+from .modeling import CSAAttention, HCAAttention, DeepSeekV4Pro2BForCausalLM, apply_rope, rope_attention_scale
 from .turbo_quant import PolarQuant
 
 
@@ -413,16 +413,16 @@ class DeepSeekV4Pro2BServingEngine:
         latent = attn.q_down(x)
         q = attn.q_up(latent).view(x.size(0), 1, self.config.num_attention_heads, self.config.attention_head_dim)
         positions = torch.tensor([position], device=x.device, dtype=torch.long)
-        q = apply_rope(q, positions, self.config.rope_dim, self.config.rope_theta)
+        q = apply_rope(q, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return attn.q_norm(q), latent
 
     def _window_entry(self, attn, x: torch.Tensor, position: int) -> torch.Tensor:
         entry = attn.window_kv(x).unsqueeze(1)
         positions = torch.tensor([position], device=x.device, dtype=torch.long)
-        entry = apply_rope(entry, positions, self.config.rope_dim, self.config.rope_theta)
+        entry = apply_rope(entry, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return attn.kv_norm(entry)
 
-    def _run_backend(self, q: torch.Tensor, values: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
+    def _run_backend(self, q: torch.Tensor, values: torch.Tensor, sink: torch.Tensor, logit_scale: float = 1.0) -> torch.Tensor:
         if values is None or values.size(1) == 0:
             return q.new_zeros(q.size(0), 1, q.size(2), q.size(3))
         # The CUDA sparse-attention kernel requires all tensors on self.device
@@ -436,14 +436,14 @@ class DeepSeekV4Pro2BServingEngine:
             sink = sink.to(self.device)
         kv = _pack_shared_kv(values)
         idx = _full_indices(q.size(0), values.size(1), q.device)
-        result = self.backend.sparse_attention(q, kv, idx, sink, q.size(-1) ** -0.5)
+        result = self.backend.sparse_attention(q, kv, idx, sink, q.size(-1) ** -0.5 * logit_scale)
         if orig_device != self.device:
             result = result.to(orig_device)
         return result
 
     def _post_attention(self, attn, out: torch.Tensor, position: int) -> torch.Tensor:
         neg_pos = torch.full((out.size(0), out.size(1)), -position, device=out.device, dtype=torch.long)
-        out = apply_rope(out, neg_pos, self.config.rope_dim, self.config.rope_theta)
+        out = apply_rope(out, neg_pos, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return attn.output(out.unsqueeze(1)).squeeze(1)
 
     def _paged_prefix_blocks(self, state: ModelServingState, layer_idx: int) -> int:
@@ -471,7 +471,7 @@ class DeepSeekV4Pro2BServingEngine:
         weights = torch.softmax(state.buffer_z.float(), dim=1).to(state.buffer_c.dtype)
         comp = (weights * state.buffer_c).sum(dim=1, keepdim=True)
         pos = torch.tensor([absolute_token], device=comp.device, dtype=torch.long)
-        comp = apply_rope(comp, pos, self.config.rope_dim, self.config.rope_theta)
+        comp = apply_rope(comp, pos, self.config.rope_dim, self.config.rope_theta, config=self.config)
         comp = attn.kv_norm(comp)
         state.compressed, state.compressed_scale = self._quant_append(
             state.compressed, state.compressed_scale, comp
@@ -494,7 +494,7 @@ class DeepSeekV4Pro2BServingEngine:
             prefix = torch.cat(prefix_parts, dim=1) if prefix_parts else None
             if prefix is not None:
                 sources = torch.cat([prefix[:, :visible], sources], dim=1)
-        out = self._run_backend(q, sources, attn.sink).squeeze(1)
+        out = self._run_backend(q, sources, attn.sink, rope_attention_scale(self.config)).squeeze(1)
         y = self._post_attention(attn, out, position)
 
         state.window = _trim(_append_seq(state.window, current_local), self.config.sliding_window)
@@ -537,7 +537,7 @@ class DeepSeekV4Pro2BServingEngine:
         main_w = torch.softmax(main_z.float(), dim=1).to(main_c.dtype)
         main_comp = (main_w * main_c).sum(dim=1, keepdim=True)
         pos = torch.tensor([absolute_token - (m - 1)], device=main_comp.device, dtype=torch.long)
-        main_comp = apply_rope(main_comp, pos, self.config.rope_dim, self.config.rope_theta)
+        main_comp = apply_rope(main_comp, pos, self.config.rope_dim, self.config.rope_theta, config=self.config)
         main_comp = attn.kv_norm(main_comp)
         state.compressed, state.compressed_scale = self._quant_append(
             state.compressed, state.compressed_scale, main_comp
@@ -597,7 +597,7 @@ class DeepSeekV4Pro2BServingEngine:
             gather = idx.unsqueeze(-1).expand(-1, -1, self.config.attention_head_dim)
             global_values = torch.gather(full_compressed[:, :visible], dim=1, index=gather)
         sources = local_sources if global_values is None else torch.cat([global_values, local_sources], dim=1)
-        out = self._run_backend(q, sources, attn.sink).squeeze(1)
+        out = self._run_backend(q, sources, attn.sink, rope_attention_scale(self.config)).squeeze(1)
         y = self._post_attention(attn, out, position)
 
         state.window = _trim(_append_seq(state.window, current_local), self.config.sliding_window)

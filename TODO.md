@@ -15,7 +15,8 @@ correctness tests (numerically validated; 31 tests pass, 0 skipped).
 - **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache with  
   Walsh-Hadamard + Lloyd-Max quantisation. Validated by needle-in-haystack eval:  
   8-bit KL ≈ 0 (near-lossless), 4-bit KL < 0.001, 100% top-1 match at all tested  
-  context lengths (64–256 tokens on CPU tiny model; GPU runs at 65K–262K use same path).
+  context lengths (64–256 tokens on CPU tiny model; latest GPU YaRN run at 2K/4K/8K
+  also passes with top-1 match 100% and KL in [5e-6, 8e-6]).
 - **Prefill OOM fix** — `chunked_fast_prefill(mhc_chunk_size=4096)` reduces mHC  
   peak from O(T×n×D) to O(C×n×D) + O(T×D). At T=262 K, n=4, D=1536: 25.2 GB → 1.2 GB.
 - **Speculative decoding** — `SpeculativeDecoder` with draft-model acceptance/rejection  
@@ -235,6 +236,10 @@ These are the hardest items and block 1M-token throughput measurement.
   Results (CPU tiny model, ctx=64/128/256):  
   - 8-bit: KL ≈ 0, max_logit_diff ≈ 0.002, top-1 match 100% — **near-lossless**  
   - 4-bit: KL < 0.001, max_logit_diff < 0.12, top-1 match 100% — **production-safe**  
+  Results (GPU, YaRN, ctx=2048/4096/8192, 4-bit):
+  - KL: 0.000008 / 0.000005 / 0.000006
+  - top-1 match: True / True / True
+  - max_logit_diff: 0.0131 / 0.0083 / 0.0094
   Results saved to `artifacts/needle_eval_results.json`.
 
 - [ ] **Standard benchmark evaluations**  
@@ -265,7 +270,12 @@ These are the hardest items and block 1M-token throughput measurement.
   acceptance/rejection sampling (Chen et al., 2023). Supports temperature, top-k,  
   EOS stopping, and self-speculative fallback. Perfect-draft (draft == target, greedy)  
   achieves 100% acceptance rate. Expected ~4× effective decode throughput at α≈0.8, K=5.  
-  Unit tests: 9 tests in `tests/test_speculative.py`.
+  Unit tests: 11 tests in `tests/test_speculative.py`.
+
+- [x] **Speculative decoding benchmark harness**  
+  `scripts/benchmark_speculative.py` measures greedy target-only vs speculative  
+  decode with a separate tiny draft model that shares the target tokenizer vocab.  
+  YaRN scaling is optional via `--yarn-scaling`.
 
 - [ ] **Multi-query and grouped-query attention variants**  
   The current configuration uses full multi-head attention for the grouped output
@@ -273,10 +283,11 @@ These are the hardest items and block 1M-token throughput measurement.
   the configuration class supports the shape parameters but they have not been
   validated at non-default settings.
 
-- [ ] **RoPE scaling for context lengths beyond training length**  
-  The model uses a fixed `rope_theta`. Long-context models typically apply YaRN or
-  linear RoPE scaling for inference beyond the trained sequence length. No such
-  scaling is implemented.
+- [x] **RoPE scaling for context lengths beyond training length**  
+  `DeepSeekV4Pro2BConfig` now exposes `max_position_embeddings` and YaRN/linear
+  scaling knobs. `get_rope_freqs(seq_len, config)` and `rope_attention_scale(config)`
+  keep the prefill and serving paths aligned, and `tests/test_rope_scaling.py`
+  exercises both the helper and a small model smoke test.
 
 ---
 

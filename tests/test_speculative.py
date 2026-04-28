@@ -56,6 +56,12 @@ def tiny_config():
     )
 
 
+def shared_vocab_tiny_config():
+    cfg = tiny_config()
+    cfg.vocab_size = DeepSeekV4Pro2BConfig().vocab_size
+    return cfg
+
+
 def make_engine(model):
     return DeepSeekV4Pro2BServingEngine(model, backend=PytorchAttentionBackend())
 
@@ -72,6 +78,19 @@ def test_speculative_decoder_constructs():
     decoder = SpeculativeDecoder(engine, engine, draft_steps=3, temperature=0.0)
     assert decoder.draft_steps == 3
     assert decoder._self_spec is True
+
+
+def test_speculative_rejects_vocab_mismatch():
+    target_cfg = tiny_config()
+    draft_cfg = shared_vocab_tiny_config()
+    torch.manual_seed(0)
+    target_model = DeepSeekV4Pro2BForCausalLM(target_cfg).eval()
+    draft_model = DeepSeekV4Pro2BForCausalLM(draft_cfg).eval()
+    target_engine = make_engine(target_model)
+    draft_engine = make_engine(draft_model)
+
+    with pytest.raises(ValueError, match="matching vocab_size"):
+        SpeculativeDecoder(target_engine, draft_engine, draft_steps=3, temperature=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +127,30 @@ def test_speculative_generate_length():
     result = decoder.generate(prompt, max_new_tokens=max_new)
     new_tokens = len(result.output_ids) - len(prompt)
     assert new_tokens == max_new, f"Expected {max_new} new tokens, got {new_tokens}"
+
+
+def test_real_draft_speculative_is_deterministic_and_accepts_tokens():
+    cfg = shared_vocab_tiny_config()
+    torch.manual_seed(11)
+    target_model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    draft_model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    draft_model.load_state_dict(target_model.state_dict())
+
+    target_engine = make_engine(target_model)
+    draft_engine = make_engine(draft_model)
+    decoder = SpeculativeDecoder(target_engine, draft_engine, draft_steps=4, temperature=0.0)
+
+    prompt = list(range(3, 515))
+    max_new = 25
+
+    first = decoder.generate(prompt, max_new_tokens=max_new)
+    second = decoder.generate(prompt, max_new_tokens=max_new)
+
+    assert first.output_ids == second.output_ids
+    assert len(first.output_ids) == len(prompt) + max_new
+    assert first.total_proposed > 0
+    assert first.total_accepted == first.total_proposed
+    assert first.mean_acceptance_rate == 1.0
 
 
 # ---------------------------------------------------------------------------

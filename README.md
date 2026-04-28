@@ -7,7 +7,7 @@ This repository contains a compact PyTorch implementation of a DeepSeek-V4-Pro-s
 - Interleaved HCA/CSA hybrid attention after the first two HCA layers
 - Token-level KV compression for HCA and overlapped two-branch compression for CSA
 - CSA lightning indexer with top-k sparse compressed KV selection
-- Shared-key-value multi-query attention, grouped output projection, partial RoPE, sliding-window KV branch, and attention sink logits
+- Shared-key-value multi-query attention, grouped output projection, partial RoPE, YaRN RoPE scaling hooks, sliding-window KV branch, and attention sink logits
 - Manifold-Constrained Hyper-Connections (mHC) with dynamic A/B/C maps and Sinkhorn projection of B
 - DeepSeekMoE-style shared plus routed experts with `sqrt(softplus(.))` affinity, first-layer hash routing, and sequence balance loss
 - MTP depth-1 auxiliary head
@@ -28,9 +28,10 @@ engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=8)   # 8-bit (near
 engine = DeepSeekV4Pro2BServingEngine(model, turbo_quant_bits=4)   # 4-bit (4× smaller)
 ```
 
-**Quality gate** (needle-in-haystack eval across context lengths 64–256):
+**Quality gate** (needle-in-haystack eval across CPU and GPU contexts):
 - 8-bit: KL ≈ 0 vs baseline, 100% top-1 match — **near-lossless**
 - 4-bit: KL < 0.001, 100% top-1 match — **production-safe**
+- Latest GPU YaRN run (`ctx=2048/4096/8192`, 4-bit): KL = `8e-6/5e-6/6e-6`, top-1 = `True/True/True`
 
 ```bash
 # Run the full quality gate eval
@@ -56,6 +57,19 @@ state = engine.chunked_fast_prefill(long_token_ids, mhc_chunk_size=4096)
 The attention sublayer still receives the full T for correct causal context.
 Only the per-position mHC pre-mix / post-mix are chunked.
 
+### YaRN RoPE Scaling
+
+`DeepSeekV4Pro2BConfig` now carries `max_position_embeddings` plus
+`rope_scaling_type`, `rope_scaling_factor`, `yarn_beta_fast`, `yarn_beta_slow`,
+and `yarn_mscale`. The shared `get_rope_freqs(seq_len, config)` helper keeps the
+prefill and serving decode RoPE schedule aligned, and `rope_attention_scale(config)`
+applies the YaRN logit correction in HCA/CSA attention.
+
+```bash
+# Long-context needle diagnostic with YaRN enabled
+python scripts/needle_eval.py --ctx-lengths 2048 4096 8192 --turbo-quant-bits 4 --rope-scaling yarn --device cuda
+```
+
 ### Speculative Decoding
 
 `deepseek_v4_pro_2b/speculative.py` — draft-model-based speculative decoding
@@ -74,6 +88,18 @@ summary = decoder.generate(prompt_ids, max_new_tokens=256, eos_token_id=2)
 print(f"Acceptance rate: {summary.mean_acceptance_rate:.2%}")
 print(f"Effective speedup: {summary.effective_speedup:.1f}×")
 # Expected: ~4–5× decode throughput at α ≈ 0.8, K = 5
+```
+
+The decoder validates that target and draft vocab sizes match before decoding.
+For real draft benchmarks, use `scripts/benchmark_speculative.py`:
+
+```bash
+python scripts/benchmark_speculative.py \
+    --target-model 2b \
+    --draft-model tiny \
+    --source-tokens 65536 131072 262144 \
+    --yarn-scaling \
+    --output-json /tmp/spec_bench.json
 ```
 
 ---
