@@ -21,15 +21,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-from deepseek_v4_pro_2b.speculative import SpeculativeDecoder, SpecDecodeSummary
-from deepseek_pipeline.serving import PytorchAttentionBackend
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM
+from aether_2b.serving import Aether2BServingEngine
+from aether_2b.speculative import SpeculativeDecoder, SpecDecodeSummary, build_self_spec_draft_model
+from aether_pipeline.serving import PytorchAttentionBackend
 
 
 def tiny_config():
-    return DeepSeekV4Pro2BConfig(
+    return Aether2BConfig(
         vocab_size=64,
         hidden_size=32,
         num_hidden_layers=2,
@@ -58,12 +58,12 @@ def tiny_config():
 
 def shared_vocab_tiny_config():
     cfg = tiny_config()
-    cfg.vocab_size = DeepSeekV4Pro2BConfig().vocab_size
+    cfg.vocab_size = Aether2BConfig().vocab_size
     return cfg
 
 
 def make_engine(model):
-    return DeepSeekV4Pro2BServingEngine(model, backend=PytorchAttentionBackend())
+    return Aether2BServingEngine(model, backend=PytorchAttentionBackend())
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ def make_engine(model):
 def test_speculative_decoder_constructs():
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
     decoder = SpeculativeDecoder(engine, engine, draft_steps=3, temperature=0.0)
     assert decoder.draft_steps == 3
@@ -84,8 +84,8 @@ def test_speculative_rejects_vocab_mismatch():
     target_cfg = tiny_config()
     draft_cfg = shared_vocab_tiny_config()
     torch.manual_seed(0)
-    target_model = DeepSeekV4Pro2BForCausalLM(target_cfg).eval()
-    draft_model = DeepSeekV4Pro2BForCausalLM(draft_cfg).eval()
+    target_model = Aether2BForCausalLM(target_cfg).eval()
+    draft_model = Aether2BForCausalLM(draft_cfg).eval()
     target_engine = make_engine(target_model)
     draft_engine = make_engine(draft_model)
 
@@ -118,7 +118,7 @@ def test_speculative_generate_length():
     """Output never exceeds prompt + max_new_tokens."""
     cfg = tiny_config()
     torch.manual_seed(42)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
     decoder = SpeculativeDecoder(engine, engine, draft_steps=3, temperature=0.0)
 
@@ -132,8 +132,8 @@ def test_speculative_generate_length():
 def test_real_draft_speculative_is_deterministic_and_accepts_tokens():
     cfg = shared_vocab_tiny_config()
     torch.manual_seed(11)
-    target_model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
-    draft_model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    target_model = Aether2BForCausalLM(cfg).eval()
+    draft_model = Aether2BForCausalLM(cfg).eval()
     draft_model.load_state_dict(target_model.state_dict())
 
     target_engine = make_engine(target_model)
@@ -161,7 +161,7 @@ def test_speculative_generate_eos_stops():
     """Generation stops when EOS is produced."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
 
     # Use temperature=0 (greedy) for determinism; with eos=argmax of first logit
@@ -187,7 +187,7 @@ def test_self_speculative_greedy_matches_standard_generate():
     """Self-spec greedy decoding matches the engine's own generate() in output."""
     cfg = tiny_config()
     torch.manual_seed(7)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
 
     prompt = [3, 5, 7, 9]
@@ -213,7 +213,7 @@ def test_perfect_draft_full_acceptance():
     """When draft model == target model, greedy spec-decode accepts all K tokens."""
     cfg = tiny_config()
     torch.manual_seed(3)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine_target = make_engine(model)
     engine_draft = make_engine(model)
 
@@ -239,7 +239,7 @@ def test_perfect_draft_full_acceptance():
 def test_output_ids_start_with_prompt():
     cfg = tiny_config()
     torch.manual_seed(1)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
     decoder = SpeculativeDecoder(engine, engine, draft_steps=2, temperature=0.0)
 
@@ -257,8 +257,59 @@ def test_output_ids_start_with_prompt():
 def test_empty_prompt_raises():
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).eval()
+    model = Aether2BForCausalLM(cfg).eval()
     engine = make_engine(model)
     decoder = SpeculativeDecoder(engine, engine, draft_steps=3, temperature=0.0)
     with pytest.raises(ValueError, match="non-empty"):
         decoder.generate([], max_new_tokens=5)
+
+
+def test_step_token_with_hidden_matches_step_token_logits():
+    """Serving helper used by shared-layer fusion preserves step_token logits."""
+    cfg = tiny_config()
+    torch.manual_seed(13)
+    model = Aether2BForCausalLM(cfg).eval()
+    engine = make_engine(model)
+
+    prompt = [2, 4, 6]
+    state_a = engine.prefill(prompt)
+    state_b = state_a.clone()
+
+    token = 7
+    logits_ref, _ = engine.step_token(token, state_a)
+    logits_hidden, _, _ = engine.step_token_with_hidden(token, state_b)
+    assert torch.allclose(logits_ref, logits_hidden, atol=1e-6, rtol=1e-6)
+
+
+def test_generate_speculative_self_spec_layers_integrated_path_runs():
+    """ServingEngine.generate_speculative supports shared-layer self-spec integration."""
+    cfg = tiny_config()
+    cfg.num_hidden_layers = 4
+    torch.manual_seed(17)
+    model = Aether2BForCausalLM(cfg).eval()
+    engine = make_engine(model)
+
+    prompt = [1, 3, 5, 7]
+    out_ids = engine.generate_speculative(
+        token_ids=prompt,
+        max_new_tokens=4,
+        self_spec_layers=2,
+        draft_steps=2,
+        temperature=0.0,
+    )
+    assert out_ids[: len(prompt)] == prompt
+    assert len(out_ids) == len(prompt) + 4
+
+
+def test_shared_layer_fusion_depth_detected_for_shared_prefix_draft():
+    """Speculative decoder detects shared-layer draft/target prefix for fused verify path."""
+    cfg = tiny_config()
+    cfg.num_hidden_layers = 4
+    torch.manual_seed(19)
+    target_model = Aether2BForCausalLM(cfg).eval()
+    draft_model = build_self_spec_draft_model(target_model, draft_layers=2)
+    target_engine = make_engine(target_model)
+    draft_engine = make_engine(draft_model)
+
+    decoder = SpeculativeDecoder(target_engine, draft_engine, draft_steps=2, temperature=0.0)
+    assert decoder._shared_layer_fusion_depth == 2

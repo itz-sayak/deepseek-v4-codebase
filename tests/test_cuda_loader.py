@@ -5,8 +5,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_kernels.loader import cuda_build_environment, cuda_extension_unavailable_reason
-from deepseek_pipeline.serving import CudaSparseAttentionBackend
+from aether_kernels.loader import cuda_build_environment, cuda_extension_unavailable_reason
+from aether_pipeline.serving import CudaSparseAttentionBackend
 
 
 def test_cuda_loader_reports_environment():

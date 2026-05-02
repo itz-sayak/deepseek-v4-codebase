@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
 import random
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 
-from deepseek_v4_pro_2b import DeepSeekV4Pro2BConfig, DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.muon import Muon, split_muon_adamw_params
-from deepseek_pipeline.tokenizer import load_deepseek_tokenizer
+try:
+    import yaml as _yaml
+except ImportError:  # pragma: no cover
+    _yaml = None  # type: ignore
+
+from aether_2b import Aether2BConfig, Aether2BForCausalLM
+from aether_2b.muon import Muon, split_muon_adamw_params
+from aether_pipeline.tokenizer import load_aether_tokenizer
 
 
 class MemmapTokens(Dataset):
@@ -137,29 +144,34 @@ class TrainConfig:
     muon_lr: float = 2e-2
     weight_decay: float = 0.1
     eval_interval: int = 1000
-    save_interval: int = 25_000
+    checkpoint_interval: int = 1000  # write latest.pt + maybe best.pth every N steps
+    save_interval: int = 25_000      # kept for back-compat; ignored when checkpoint_interval is set
     resume_from: Optional[str] = None
     auto_resume: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float32"
     preset: str = "2b"
-    # --- TODO 4: multi-GPU / training-efficiency flags ---
-    fsdp: bool = False                  # wrap model with FSDP (requires torchrun)
-    gradient_checkpointing: bool = False  # per-layer activation checkpointing
-    sequence_packing: bool = False      # use PackedMemmapTokens instead of MemmapTokens
-    warmup_steps: int = 2000            # linear LR warmup steps
-    lr_min_ratio: float = 0.1           # cosine decay floor as fraction of peak LR
+    variant: str = "moe"             # "moe" or "dense"  ← architecture switch
+    # --- multi-GPU / training-efficiency flags ---
+    fsdp: bool = False
+    gradient_checkpointing: bool = False
+    sequence_packing: bool = False
+    warmup_steps: int = 2000
+    lr_min_ratio: float = 0.1
+    # --- ETA reporting ---
+    eta_window: int = 50             # rolling step window for ETA estimate
 
 
-def make_model_config(tokenizer_name: str, tokenizer_cache_dir: Optional[str], preset: str) -> DeepSeekV4Pro2BConfig:
-    tok = load_deepseek_tokenizer(tokenizer_name, tokenizer_cache_dir)
-    cfg = DeepSeekV4Pro2BConfig(
-        vocab_size=tok.vocab_size,
-        bos_token_id=tok.bos_token_id,
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.pad_token_id,
-    )
+def make_model_config(tokenizer_name: str, tokenizer_cache_dir: Optional[str], preset: str, variant: str = "moe") -> Aether2BConfig:
+    tok = load_aether_tokenizer(tokenizer_name, tokenizer_cache_dir)
     if preset == "tiny":
+        # Tiny model: always MoE-style (too small to benefit from dense variant)
+        cfg = Aether2BConfig(
+            vocab_size=tok.vocab_size,
+            bos_token_id=tok.bos_token_id,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.pad_token_id,
+        )
         cfg.hidden_size = 64
         cfg.num_hidden_layers = 4
         cfg.num_attention_heads = 4
@@ -180,11 +192,83 @@ def make_model_config(tokenizer_name: str, tokenizer_cache_dir: Optional[str], p
         cfg.hash_routed_layers = 1
         cfg.mhc_expansion = 2
         cfg.mtp_depth = 1
+        return cfg
+
+    # Full 2B scale
+    if variant == "dense":
+        cfg = Aether2BConfig.dense_2b()
+    else:
+        cfg = Aether2BConfig()
+    # Sync tokenizer vocab / special tokens.
+    cfg.vocab_size = tok.vocab_size
+    cfg.bos_token_id = tok.bos_token_id
+    cfg.eos_token_id = tok.eos_token_id
+    cfg.pad_token_id = tok.pad_token_id
     return cfg
 
 
-def save_checkpoint(output_dir: str, step: int, model, adamw, muon, train_cfg: TrainConfig, model_cfg: DeepSeekV4Pro2BConfig) -> str:
+def save_checkpoint(output_dir: str, step: int, model, adamw, muon, train_cfg: TrainConfig, model_cfg: Aether2BConfig) -> str:
     raise NotImplementedError("Use save_training_state instead.")
+
+
+class ETATracker:
+    """Rolling-window ETA estimator.
+
+    Call ``tick(step, tokens_processed)`` after every optimizer step.
+    ``eta_str`` returns a human-readable ``hh:mm:ss`` string (or ``--:--:--``
+    until enough data has been collected).
+    """
+
+    def __init__(self, total_steps: int, window: int = 50) -> None:
+        self.total_steps = total_steps
+        self._window: Deque[tuple[int, int, float]] = collections.deque(maxlen=window)
+        self._train_start = time.perf_counter()
+
+    def tick(self, step: int, tokens_processed: int) -> None:
+        self._window.append((step, tokens_processed, time.perf_counter()))
+
+    @property
+    def tokens_per_sec(self) -> Optional[float]:
+        if len(self._window) < 2:
+            return None
+        oldest = self._window[0]
+        newest = self._window[-1]
+        dt = newest[2] - oldest[2]
+        if dt <= 0:
+            return None
+        return (newest[1] - oldest[1]) / dt
+
+    @property
+    def steps_per_sec(self) -> Optional[float]:
+        if len(self._window) < 2:
+            return None
+        oldest = self._window[0]
+        newest = self._window[-1]
+        dt = newest[2] - oldest[2]
+        if dt <= 0:
+            return None
+        return (newest[0] - oldest[0]) / dt
+
+    def eta_seconds(self, current_step: int) -> Optional[float]:
+        sps = self.steps_per_sec
+        if sps is None or sps <= 0:
+            return None
+        return (self.total_steps - current_step) / sps
+
+    def eta_str(self, current_step: int) -> str:
+        secs = self.eta_seconds(current_step)
+        if secs is None:
+            return "--:--:--"
+        secs = int(secs)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def elapsed_str(self) -> str:
+        secs = int(time.perf_counter() - self._train_start)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _stack_batch(samples: list[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -250,7 +334,7 @@ def _build_checkpoint_payload(
     adamw,
     muon,
     train_cfg: TrainConfig,
-    model_cfg: DeepSeekV4Pro2BConfig,
+    model_cfg: Aether2BConfig,
 ) -> Dict[str, object]:
     return {
         "step": step,
@@ -288,7 +372,7 @@ def save_training_state(
     adamw,
     muon,
     train_cfg: TrainConfig,
-    model_cfg: DeepSeekV4Pro2BConfig,
+    model_cfg: Aether2BConfig,
 ) -> Dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     payload = _build_checkpoint_payload(
@@ -442,8 +526,8 @@ def train(cfg: TrainConfig) -> None:
 
     is_main = rank == 0
 
-    model_cfg = make_model_config(cfg.tokenizer_name, cfg.tokenizer_cache_dir, cfg.preset)
-    model = DeepSeekV4Pro2BForCausalLM(model_cfg).to(cfg.device)
+    model_cfg = make_model_config(cfg.tokenizer_name, cfg.tokenizer_cache_dir, cfg.preset, cfg.variant)
+    model = Aether2BForCausalLM(model_cfg).to(cfg.device)
 
     # ------------------------------------------------------------------
     # Gradient checkpointing (applied before FSDP wrapping)
@@ -541,6 +625,22 @@ def train(cfg: TrainConfig) -> None:
     best_metric_name = resume_state["best_metric_name"]
     best_step = int(resume_state["best_step"])
 
+    eta = ETATracker(total_steps=total_steps, window=cfg.eta_window)
+
+    # Log the run header so it's easy to see which variant is being trained.
+    if is_main:
+        from aether_2b.sizing import estimate_config_parameters
+        total_params = estimate_config_parameters(model_cfg)
+        print(json.dumps({
+            "status": "train_start",
+            "variant": cfg.variant,
+            "preset": cfg.preset,
+            "total_params_B": round(total_params / 1e9, 3),
+            "total_steps": total_steps,
+            "checkpoint_interval": cfg.checkpoint_interval,
+            "checkpoint_dir": cfg.output_dir,
+        }))
+
     model.train()
     for next_step in range(step + 1, total_steps + 1):
         remaining_micro_batches = _remaining_micro_batches(
@@ -579,39 +679,39 @@ def train(cfg: TrainConfig) -> None:
         step = next_step
 
         if is_main:
+            eta.tick(step, tokens_processed)
+
             if step == 1 or step % cfg.eval_interval == 0:
                 val_loss = evaluate(model, val_loader, cfg.device, dtype_ctx)
-                print(
-                    json.dumps(
-                        {
-                            "step": step,
-                            "epoch": epoch,
-                            "train_loss": accum_loss,
-                            "val_loss": val_loss,
-                            "tokens_processed": tokens_processed,
-                            "next_token_offset": next_sample_index * cfg.seq_len,
-                            "lr_scale": round(lr_scale, 6),
-                        }
-                    )
-                )
             else:
                 val_loss = None
-                print(
-                    json.dumps(
-                        {
-                            "step": step,
-                            "epoch": epoch,
-                            "train_loss": accum_loss,
-                            "tokens_processed": tokens_processed,
-                            "next_token_offset": next_sample_index * cfg.seq_len,
-                            "lr_scale": round(lr_scale, 6),
-                        }
-                    )
-                )
+
+            log_entry: Dict[str, object] = {
+                "step": step,
+                "total_steps": total_steps,
+                "epoch": epoch,
+                "train_loss": round(accum_loss, 6),
+                "tokens_processed": tokens_processed,
+                "next_token_offset": next_sample_index * cfg.seq_len,
+                "lr_scale": round(lr_scale, 6),
+                "elapsed": eta.elapsed_str(),
+                "eta": eta.eta_str(step),
+            }
+            tps = eta.tokens_per_sec
+            if tps is not None:
+                log_entry["tok_per_sec"] = round(tps, 1)
+            if val_loss is not None:
+                log_entry["val_loss"] = round(val_loss, 6)
+            print(json.dumps(log_entry))
+
         else:
             val_loss = None
 
-        if is_main:
+        # ------------------------------------------------------------------
+        # Checkpointing — only checkpoint-latest.pt and best.pth
+        # ------------------------------------------------------------------
+        ckpt_interval = cfg.checkpoint_interval
+        if is_main and (step % ckpt_interval == 0 or step == total_steps):
             metric_name = "val_loss" if val_loss is not None else "train_loss"
             metric_value = val_loss if val_loss is not None else accum_loss
             save_best = best_metric is None or metric_value < best_metric
@@ -620,10 +720,7 @@ def train(cfg: TrainConfig) -> None:
                 best_metric_name = metric_name
                 best_step = step
 
-            # For FSDP: gather full state dict on rank 0 before saving.
             model_sd = _fsdp_state_dict(model) if _is_fsdp_wrapped(model) else model.state_dict()
-
-            # Build payload manually to inject the FSDP-gathered state dict.
             payload = {
                 "step": step,
                 "epoch": epoch,
@@ -645,17 +742,13 @@ def train(cfg: TrainConfig) -> None:
             os.makedirs(cfg.output_dir, exist_ok=True)
             latest_path = os.path.join(cfg.output_dir, "checkpoint-latest.pt")
             torch.save(payload, latest_path)
-            saved_paths = {"latest": latest_path}
-            if step % cfg.save_interval == 0 or step == total_steps:
-                step_path = os.path.join(cfg.output_dir, f"checkpoint-step-{step}.pt")
-                torch.save(payload, step_path)
-                saved_paths["step"] = step_path
-                print(f"saved_checkpoint={step_path}")
+            print(json.dumps({"saved_checkpoint": latest_path, "step": step}))
+
             if save_best:
                 best_path = os.path.join(cfg.output_dir, "best.pth")
                 torch.save(payload, best_path)
-                saved_paths["best"] = best_path
-                print(f"saved_best={best_path}")
+                print(json.dumps({"saved_best": best_path, "step": step,
+                                  "best_metric": metric_name, "best_value": round(metric_value, 6)}))
 
         # Barrier: all ranks wait before the next step so rank-0 state dict
         # gather above doesn't race with the next FSDP forward.
@@ -663,61 +756,107 @@ def train(cfg: TrainConfig) -> None:
             dist.barrier()
 
 
+def _load_yaml_config(path: str) -> Dict[str, object]:
+    if _yaml is None:
+        raise ImportError("PyYAML is required to load config files: uv pip install pyyaml")
+    with open(path) as fh:
+        data = _yaml.safe_load(fh)
+    return data or {}
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the DeepSeek-style 2B model on tokenized reference-source data.")
-    parser.add_argument("--data-dir", default="./artifacts/tokenized")
-    parser.add_argument("--output-dir", default="./artifacts/checkpoints")
-    parser.add_argument("--tokenizer-name", default=os.environ.get("DEEPSEEK_TOKENIZER_NAME", "deepseek-ai/DeepSeek-V3.2"))
-    parser.add_argument("--tokenizer-cache-dir", default=os.environ.get("HF_HOME"))
-    parser.add_argument("--seq-len", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--learning-rate", type=float, default=2.2e-4)
-    parser.add_argument("--muon-lr", type=float, default=2e-2)
-    parser.add_argument("--eval-interval", type=int, default=1000)
-    parser.add_argument("--save-interval", type=int, default=25_000)
-    parser.add_argument("--resume-from")
-    parser.add_argument("--no-auto-resume", action="store_true")
-    parser.add_argument("--preset", choices=["2b", "tiny"], default="2b")
-    # TODO-4 multi-GPU flags
-    parser.add_argument("--fsdp", action="store_true",
-                        help="Wrap model with FSDP (launch with torchrun)")
-    parser.add_argument("--gradient-checkpointing", action="store_true",
-                        help="Enable per-layer activation checkpointing")
-    parser.add_argument("--sequence-packing", action="store_true",
-                        help="Use PackedMemmapTokens for dense cross-document packing")
-    parser.add_argument("--warmup-steps", type=int, default=2000,
-                        help="Linear LR warmup steps before cosine decay")
-    parser.add_argument("--lr-min-ratio", type=float, default=0.1,
-                        help="Minimum LR as a fraction of peak LR (cosine floor)")
+    parser = argparse.ArgumentParser(description="Train the Aether 2B model on tokenized reference-source data.")
+    parser.add_argument("--config", metavar="YAML",
+                        help="Path to a YAML config file (e.g. configs/train.yaml). "
+                             "All fields can be overridden by subsequent CLI flags.")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--tokenizer-name", default=None)
+    parser.add_argument("--tokenizer-cache-dir", default=None)
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--grad-accum", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--muon-lr", type=float, default=None)
+    parser.add_argument("--eval-interval", type=int, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=None,
+                        help="Save checkpoint every N optimizer steps (default: 1000). "
+                             "Only checkpoint-latest.pt and best.pth are kept.")
+    parser.add_argument("--save-interval", type=int, default=None,
+                        help="Deprecated alias for --checkpoint-interval.")
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--no-auto-resume", action="store_true", default=None)
+    parser.add_argument("--preset", choices=["2b", "tiny"], default=None)
+    parser.add_argument("--variant", choices=["moe", "dense"], default=None,
+                        help="Architecture variant: 'moe' (2.111B, default) or 'dense' (2.135B, no routing).")
+    parser.add_argument("--fsdp", action="store_true", default=None)
+    parser.add_argument("--gradient-checkpointing", action="store_true", default=None)
+    parser.add_argument("--sequence-packing", action="store_true", default=None)
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--lr-min-ratio", type=float, default=None)
+    parser.add_argument("--eta-window", type=int, default=None,
+                        help="Rolling step window for ETA estimate (default: 50).")
     args = parser.parse_args()
-    train(
-        TrainConfig(
-            data_dir=args.data_dir,
-            output_dir=args.output_dir,
-            tokenizer_name=args.tokenizer_name,
-            tokenizer_cache_dir=args.tokenizer_cache_dir,
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            grad_accum=args.grad_accum,
-            epochs=args.epochs,
-            max_steps=args.max_steps,
-            learning_rate=args.learning_rate,
-            muon_lr=args.muon_lr,
-            eval_interval=args.eval_interval,
-            save_interval=args.save_interval,
-            resume_from=args.resume_from,
-            auto_resume=not args.no_auto_resume,
-            preset=args.preset,
-            fsdp=args.fsdp,
-            gradient_checkpointing=args.gradient_checkpointing,
-            sequence_packing=args.sequence_packing,
-            warmup_steps=args.warmup_steps,
-            lr_min_ratio=args.lr_min_ratio,
-        )
-    )
+
+    # ------------------------------------------------------------------
+    # Build config: YAML base → CLI overrides → dataclass defaults
+    # ------------------------------------------------------------------
+    yaml_cfg: Dict[str, object] = {}
+    if args.config:
+        yaml_cfg = _load_yaml_config(args.config)
+
+    def _get(cli_val, yaml_key: str, default):
+        if cli_val is not None:
+            return cli_val
+        return yaml_cfg.get(yaml_key, default)
+
+    # For boolean flags, argparse returns None when not passed (default=None above).
+    def _get_bool(cli_val, yaml_key: str, default: bool) -> bool:
+        if cli_val is not None and cli_val is not False:
+            return True   # store_true flag was explicitly set
+        if yaml_key in yaml_cfg:
+            return bool(yaml_cfg[yaml_key])
+        return default
+
+    # checkpoint_interval: prefer explicit CLI, then yaml checkpoint_interval,
+    # then yaml save_interval (back-compat), then hard default 1000.
+    ckpt_interval = args.checkpoint_interval or args.save_interval
+    if ckpt_interval is None:
+        ckpt_interval = int(yaml_cfg.get("checkpoint_interval",
+                             yaml_cfg.get("save_interval", 1000)))
+
+    _default_cfg = TrainConfig(data_dir=".", output_dir=".", tokenizer_name="", tokenizer_cache_dir=None)
+
+    train(TrainConfig(
+        data_dir=_get(args.data_dir, "data_dir", "./artifacts/tokenized"),
+        output_dir=_get(args.output_dir, "output_dir", "./artifacts/checkpoints"),
+        tokenizer_name=_get(args.tokenizer_name, "tokenizer_name",
+                            os.environ.get("AETHER_TOKENIZER_NAME", "deepseek-ai/DeepSeek-V3.2")),
+        tokenizer_cache_dir=_get(args.tokenizer_cache_dir, "tokenizer_cache_dir",
+                                 os.environ.get("HF_HOME")),
+        seq_len=_get(args.seq_len, "seq_len", _default_cfg.seq_len),
+        batch_size=_get(args.batch_size, "batch_size", _default_cfg.batch_size),
+        grad_accum=_get(args.grad_accum, "grad_accum", _default_cfg.grad_accum),
+        epochs=_get(args.epochs, "epochs", _default_cfg.epochs),
+        max_steps=_get(args.max_steps, "max_steps", _default_cfg.max_steps),
+        learning_rate=_get(args.learning_rate, "learning_rate", _default_cfg.learning_rate),
+        muon_lr=_get(args.muon_lr, "muon_lr", _default_cfg.muon_lr),
+        eval_interval=_get(args.eval_interval, "eval_interval", _default_cfg.eval_interval),
+        checkpoint_interval=ckpt_interval,
+        save_interval=ckpt_interval,  # keep field in sync
+        resume_from=_get(args.resume_from, "resume_from", _default_cfg.resume_from),
+        auto_resume=not _get_bool(args.no_auto_resume, "__no_auto_resume__", False),
+        preset=_get(args.preset, "preset", _default_cfg.preset),
+        variant=_get(args.variant, "variant", _default_cfg.variant),
+        fsdp=_get_bool(args.fsdp, "fsdp", _default_cfg.fsdp),
+        gradient_checkpointing=_get_bool(args.gradient_checkpointing, "gradient_checkpointing", _default_cfg.gradient_checkpointing),
+        sequence_packing=_get_bool(args.sequence_packing, "sequence_packing", _default_cfg.sequence_packing),
+        warmup_steps=_get(args.warmup_steps, "warmup_steps", _default_cfg.warmup_steps),
+        lr_min_ratio=_get(args.lr_min_ratio, "lr_min_ratio", _default_cfg.lr_min_ratio),
+        eta_window=_get(args.eta_window, "eta_window", _default_cfg.eta_window),
+    ))
 
 
 if __name__ == "__main__":

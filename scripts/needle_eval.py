@@ -34,23 +34,23 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.serving import (
-    DeepSeekV4Pro2BServingEngine,
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM
+from aether_2b.serving import (
+    Aether2BServingEngine,
     HCAServingState,
     CSAServingState,
     ModelServingState,
 )
-from deepseek_pipeline.serving import PytorchAttentionBackend
+from aether_pipeline.serving import PytorchAttentionBackend
 
 
 # ---------------------------------------------------------------------------
 # Tiny model config (identical to test infrastructure)
 # ---------------------------------------------------------------------------
 
-def _tiny_config() -> DeepSeekV4Pro2BConfig:
-    return DeepSeekV4Pro2BConfig(
+def _tiny_config() -> Aether2BConfig:
+    return Aether2BConfig(
         vocab_size=256,
         hidden_size=64,
         num_hidden_layers=4,
@@ -118,7 +118,7 @@ def _top1_match(logits_ref: torch.Tensor, logits_test: torch.Tensor) -> bool:
 # ---------------------------------------------------------------------------
 
 def evaluate_config(
-    model: DeepSeekV4Pro2BForCausalLM,
+    model: Aether2BForCausalLM,
     ctx_length: int,
     turbo_quant_bits: Optional[int],
     baseline_state: Optional[ModelServingState],
@@ -134,7 +134,7 @@ def evaluate_config(
 
     cfg = model.config
     backend = PytorchAttentionBackend()
-    engine = DeepSeekV4Pro2BServingEngine(
+    engine = Aether2BServingEngine(
         model, backend=backend, turbo_quant_bits=turbo_quant_bits
     )
 
@@ -265,7 +265,7 @@ def main():
         )
     torch.manual_seed(0)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    model = DeepSeekV4Pro2BForCausalLM(cfg).to(device=device, dtype=dtype).eval()
+    model = Aether2BForCausalLM(cfg).to(device=device, dtype=dtype).eval()
 
     bits_configs = [None, args.turbo_quant_bits] if args.turbo_quant_bits is not None else [None, 8, 4]
     all_results = []

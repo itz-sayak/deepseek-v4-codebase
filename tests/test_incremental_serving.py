@@ -7,15 +7,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_kernels.paged_kv_allocator import PagedKVAllocator
-from deepseek_pipeline.serving import HybridCacheLayout, LongContextServingManager, OnDiskPrefixKVStore, PytorchAttentionBackend, SWACacheMode
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
+from aether_kernels.paged_kv_allocator import PagedKVAllocator
+from aether_pipeline.serving import HybridCacheLayout, LongContextServingManager, OnDiskPrefixKVStore, PytorchAttentionBackend, SWACacheMode
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM
+from aether_2b.serving import Aether2BServingEngine
 
 
 def tiny_config():
-    return DeepSeekV4Pro2BConfig(
+    return Aether2BConfig(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=4,
@@ -42,10 +42,10 @@ def tiny_config():
 
 
 def make_engine(tmp_path=None, swa_mode=SWACacheMode.FULL, checkpoint_stride=8):
-    model = DeepSeekV4Pro2BForCausalLM(tiny_config()).eval()
+    model = Aether2BForCausalLM(tiny_config()).eval()
     backend = PytorchAttentionBackend()
     if tmp_path is None:
-        return model, DeepSeekV4Pro2BServingEngine(model, backend=backend, device="cpu")
+        return model, Aether2BServingEngine(model, backend=backend, device="cpu")
     layout = HybridCacheLayout(
         csa_compression=model.config.csa_compression,
         hca_compression=model.config.hca_compression,
@@ -54,11 +54,11 @@ def make_engine(tmp_path=None, swa_mode=SWACacheMode.FULL, checkpoint_stride=8):
     )
     store = OnDiskPrefixKVStore(str(tmp_path), layout, swa_mode=swa_mode, checkpoint_stride=checkpoint_stride)
     manager = LongContextServingManager(store, backend=backend)
-    return model, DeepSeekV4Pro2BServingEngine(model, prefix_manager=manager, device="cpu")
+    return model, Aether2BServingEngine(model, prefix_manager=manager, device="cpu")
 
 
 def make_engine_with_allocator(tmp_path, swa_mode=SWACacheMode.FULL, checkpoint_stride=8):
-    model = DeepSeekV4Pro2BForCausalLM(tiny_config()).eval()
+    model = Aether2BForCausalLM(tiny_config()).eval()
     backend = PytorchAttentionBackend()
     layout = HybridCacheLayout(
         csa_compression=model.config.csa_compression,
@@ -67,7 +67,7 @@ def make_engine_with_allocator(tmp_path, swa_mode=SWACacheMode.FULL, checkpoint_
         num_layers=model.config.num_hidden_layers,
     )
     store = OnDiskPrefixKVStore(str(tmp_path / "prefix"), layout, swa_mode=swa_mode, checkpoint_stride=checkpoint_stride)
-    shape_probe = DeepSeekV4Pro2BServingEngine(model, backend=backend, device="cpu")
+    shape_probe = Aether2BServingEngine(model, backend=backend, device="cpu")
     allocator = PagedKVAllocator(
         num_device_pages=4,
         num_host_pages=8,
@@ -76,7 +76,7 @@ def make_engine_with_allocator(tmp_path, swa_mode=SWACacheMode.FULL, checkpoint_
         device="cpu",
     )
     manager = LongContextServingManager(store, backend=backend)
-    return model, allocator, DeepSeekV4Pro2BServingEngine(
+    return model, allocator, Aether2BServingEngine(
         model,
         prefix_manager=manager,
         paged_allocator=allocator,

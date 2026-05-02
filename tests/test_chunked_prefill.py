@@ -2,7 +2,7 @@
 
 Validates that:
   1. chunked_forward on ManifoldConstrainedHyperConnection matches standard forward.
-  2. chunked_forward on DeepSeekV4Pro2BModel matches standard forward.
+  2. chunked_forward on Aether2BModel matches standard forward.
   3. chunked_fast_prefill produces identical serving state to fast_prefill.
   4. chunked_fast_prefill + step_token produces identical logits.
 """
@@ -18,20 +18,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import (
-    DeepSeekV4Pro2BForCausalLM,
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import (
+    Aether2BForCausalLM,
     ManifoldConstrainedHyperConnection,
     HCAAttention,
     CSAAttention,
-    DeepSeekMoE,
+    AetherMoE,
 )
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-from deepseek_pipeline.serving import PytorchAttentionBackend
+from aether_2b.serving import Aether2BServingEngine
+from aether_pipeline.serving import PytorchAttentionBackend
 
 
 def tiny_config():
-    return DeepSeekV4Pro2BConfig(
+    return Aether2BConfig(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=4,
@@ -82,10 +82,10 @@ def test_mhc_chunked_forward_matches_standard_attn():
 
 
 def test_mhc_chunked_forward_matches_standard_moe():
-    """chunked_forward with DeepSeekMoE sublayer matches standard forward."""
+    """chunked_forward with AetherMoE sublayer matches standard forward."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    mhc = ManifoldConstrainedHyperConnection(cfg, DeepSeekMoE(cfg, layer_idx=0))
+    mhc = ManifoldConstrainedHyperConnection(cfg, AetherMoE(cfg, layer_idx=0))
     mhc.eval()
 
     torch.manual_seed(42)
@@ -124,10 +124,10 @@ def test_mhc_chunked_forward_falls_back_for_short_seq():
 # ---------------------------------------------------------------------------
 
 def test_model_chunked_forward_matches_standard():
-    """DeepSeekV4Pro2BModel.chunked_forward matches standard forward."""
+    """Aether2BModel.chunked_forward matches standard forward."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     torch.manual_seed(42)
@@ -152,16 +152,16 @@ def test_chunked_fast_prefill_matches_fast_prefill():
     """chunked_fast_prefill produces identical serving state to fast_prefill."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     backend = PytorchAttentionBackend()
     token_ids = list(range(3, 35))
 
-    engine_std = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_std = Aether2BServingEngine(model, backend=backend)
     state_std = engine_std.fast_prefill(token_ids)
 
-    engine_chunked = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_chunked = Aether2BServingEngine(model, backend=backend)
     state_chunked = engine_chunked.chunked_fast_prefill(token_ids, mhc_chunk_size=8)
 
     assert state_std.token_count == state_chunked.token_count
@@ -175,18 +175,18 @@ def test_chunked_fast_prefill_step_token_logits_match():
     """After chunked_fast_prefill + step_token, logits match fast_prefill + step_token."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     backend = PytorchAttentionBackend()
     token_ids = list(range(3, 35))
     next_token = torch.tensor([7])
 
-    engine_std = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_std = Aether2BServingEngine(model, backend=backend)
     state_std = engine_std.fast_prefill(token_ids)
     logits_std, _ = engine_std.step_token(next_token, state_std)
 
-    engine_chunked = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_chunked = Aether2BServingEngine(model, backend=backend)
     state_chunked = engine_chunked.chunked_fast_prefill(token_ids, mhc_chunk_size=8)
     logits_chunked, _ = engine_chunked.step_token(next_token, state_chunked)
 
@@ -201,9 +201,9 @@ def test_chunked_fast_prefill_empty_input():
     """chunked_fast_prefill([]) returns an empty state."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
-    engine = DeepSeekV4Pro2BServingEngine(model, backend=PytorchAttentionBackend())
+    engine = Aether2BServingEngine(model, backend=PytorchAttentionBackend())
     state = engine.chunked_fast_prefill([], mhc_chunk_size=8)
     assert state.token_count == 0
 
@@ -212,16 +212,16 @@ def test_chunked_fast_prefill_short_sequence_identical():
     """When len(token_ids) < mhc_chunk_size, fallback to standard forward."""
     cfg = tiny_config()
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     backend = PytorchAttentionBackend()
     token_ids = [5, 6, 7, 8]  # shorter than any reasonable chunk size
 
-    engine1 = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine1 = Aether2BServingEngine(model, backend=backend)
     state1 = engine1.fast_prefill(token_ids)
 
-    engine2 = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine2 = Aether2BServingEngine(model, backend=backend)
     state2 = engine2.chunked_fast_prefill(token_ids, mhc_chunk_size=4096)
 
     assert state1.token_count == state2.token_count

@@ -9,16 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_pipeline.download import save_source
-from deepseek_pipeline.manifest import SourceSpec
-from deepseek_pipeline.preprocess import load_preprocessed_source
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.muon import Muon
+from aether_pipeline.download import save_source
+from aether_pipeline.manifest import SourceSpec
+from aether_pipeline.preprocess import load_preprocessed_source
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM
+from aether_2b.muon import Muon
 
 
 def tiny_config():
-    return DeepSeekV4Pro2BConfig(
+    return Aether2BConfig(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=4,
@@ -45,7 +45,7 @@ def tiny_config():
 
 
 def test_forward_with_padding_and_labels():
-    model = DeepSeekV4Pro2BForCausalLM(tiny_config())
+    model = Aether2BForCausalLM(tiny_config())
     input_ids = torch.tensor(
         [
             [1, 2, 3, 4, 5, 0, 0, 0],
@@ -75,7 +75,7 @@ def test_all_ignored_and_fully_masked_batch_is_finite():
     cfg.group_output_dim = 24
     cfg.query_compression_dim = 24
     cfg.indexer_head_dim = 6
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     input_ids = torch.tensor([[0, 0, 0, 0], [1, 2, 3, 4]], dtype=torch.long)
     attention_mask = torch.tensor([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=torch.long)
     labels = torch.full_like(input_ids, -100)
@@ -118,7 +118,7 @@ def test_download_resume_recovers_from_partial_source(tmp_path, monkeypatch):
                 raise RuntimeError("stream interrupted")
             yield index, raw_items[index]
 
-    monkeypatch.setattr("deepseek_pipeline.download._iter_source_items", fake_iter_source_items)
+    monkeypatch.setattr("aether_pipeline.download._iter_source_items", fake_iter_source_items)
 
     output_root = tmp_path / "datasets"
     with pytest.raises(RuntimeError, match="stream interrupted"):
@@ -148,29 +148,29 @@ def test_download_resume_recovers_from_partial_source(tmp_path, monkeypatch):
 
 def _make_serving_engine(config, seed=0):
     """Construct a tiny model + ServingEngine with a fixed seed."""
-    from deepseek_v4_pro_2b.serving import ServingEngine
+    from aether_2b.serving import ServingEngine
     torch.manual_seed(seed)
-    model = DeepSeekV4Pro2BForCausalLM(config)
+    model = Aether2BForCausalLM(config)
     model.eval()
     return ServingEngine(model)
 
 
 def test_fast_prefill_matches_step_token_next_logits():
     """fast_prefill state must produce identical next-token logits to prefill()."""
-    from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-    from deepseek_pipeline.serving import PytorchAttentionBackend
+    from aether_2b.serving import Aether2BServingEngine
+    from aether_pipeline.serving import PytorchAttentionBackend
     cfg = tiny_config()
     torch.manual_seed(42)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     token_ids = torch.randint(0, cfg.vocab_size, (12,))
 
     backend = PytorchAttentionBackend()
-    engine_slow = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_slow = Aether2BServingEngine(model, backend=backend)
     state_slow = engine_slow.prefill(token_ids)
 
-    engine_fast = DeepSeekV4Pro2BServingEngine(model, backend=backend)
+    engine_fast = Aether2BServingEngine(model, backend=backend)
     state_fast = engine_fast.fast_prefill(token_ids)
 
     next_token = torch.tensor([7])
@@ -185,17 +185,17 @@ def test_fast_prefill_matches_step_token_next_logits():
 
 def test_offload_restore_preserves_step_token():
     """offload_swa_to_host + restore_swa_to_device must preserve step_token output."""
-    from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-    from deepseek_pipeline.serving import PytorchAttentionBackend
+    from aether_2b.serving import Aether2BServingEngine
+    from aether_pipeline.serving import PytorchAttentionBackend
     cfg = tiny_config()
     torch.manual_seed(7)
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
+    model = Aether2BForCausalLM(cfg)
     model.eval()
 
     token_ids = torch.randint(0, cfg.vocab_size, (8,))
     next_token = torch.tensor([3])
 
-    engine = DeepSeekV4Pro2BServingEngine(model, backend=PytorchAttentionBackend())
+    engine = Aether2BServingEngine(model, backend=PytorchAttentionBackend())
     state = engine.prefill(token_ids)
 
     import copy

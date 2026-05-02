@@ -5,8 +5,8 @@ import time
 
 import torch
 
-from deepseek_kernels.loader import load_deepseek_cuda_kernels
-from deepseek_pipeline.serving import PytorchAttentionBackend
+from aether_kernels.loader import load_aether_cuda_kernels
+from aether_pipeline.serving import PytorchAttentionBackend
 
 
 def run_once(batch: int, target_tokens: int, heads: int, head_dim: int, source_tokens: int, top_k: int, dtype: torch.dtype):
@@ -15,7 +15,7 @@ def run_once(batch: int, target_tokens: int, heads: int, head_dim: int, source_t
     topk = torch.randint(0, source_tokens, (batch, target_tokens, top_k), device="cuda", dtype=torch.int32)
     sink = torch.zeros(heads, device="cuda", dtype=dtype)
     scale = head_dim ** -0.5
-    ext = load_deepseek_cuda_kernels()
+    ext = load_aether_cuda_kernels()
     ref = PytorchAttentionBackend()
 
     for _ in range(10):

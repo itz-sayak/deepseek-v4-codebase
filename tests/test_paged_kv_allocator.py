@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_kernels.paged_kv_allocator import PagedKVAllocator
+from aether_kernels.paged_kv_allocator import PagedKVAllocator
 
 
 def test_paged_allocator_spills_to_disk_and_keeps_handle_slots_consistent(tmp_path):

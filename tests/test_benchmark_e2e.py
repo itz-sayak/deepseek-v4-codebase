@@ -7,13 +7,13 @@ if str(ROOT) not in sys.path:
 
 import torch
 
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
+from aether_2b.modeling import Aether2BForCausalLM
 from scripts.benchmark_e2e_serving import _tiny_config, run_benchmark
-from deepseek_pipeline.serving import SWACacheMode
+from aether_pipeline.serving import SWACacheMode
 
 
 def test_run_benchmark_uses_scheduler_batching(tmp_path):
-    model = DeepSeekV4Pro2BForCausalLM(_tiny_config()).eval()
+    model = Aether2BForCausalLM(_tiny_config()).eval()
     result = run_benchmark(
         model=model,
         source_tokens=32,
@@ -37,7 +37,7 @@ def test_run_benchmark_uses_scheduler_batching(tmp_path):
 
 
 def test_run_benchmark_can_enable_allocator_backed_prefixes(tmp_path):
-    model = DeepSeekV4Pro2BForCausalLM(_tiny_config()).eval()
+    model = Aether2BForCausalLM(_tiny_config()).eval()
     result = run_benchmark(
         model=model,
         source_tokens=32,

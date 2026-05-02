@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_v4_pro_2b.turbo_quant import PolarQuant, _wht
+from aether_2b.turbo_quant import PolarQuant, _wht
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +204,12 @@ def test_polar_quant_invalid_bits():
 
 def test_serving_engine_no_quant_is_noop():
     """With turbo_quant_bits=None, compressed state stays bf16 and scale is None."""
-    from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine, HCAServingState
-    from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-    from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-    from deepseek_pipeline.serving import PytorchAttentionBackend
+    from aether_2b.serving import Aether2BServingEngine, HCAServingState
+    from aether_2b.configuration import Aether2BConfig
+    from aether_2b.modeling import Aether2BForCausalLM
+    from aether_pipeline.serving import PytorchAttentionBackend
 
-    cfg = DeepSeekV4Pro2BConfig(
+    cfg = Aether2BConfig(
         num_hidden_layers=2, hidden_size=64, num_attention_heads=2,
         attention_head_dim=16, query_compression_dim=32, indexer_num_heads=2,
         indexer_head_dim=8, mhc_expansion=2, hca_compression=4, csa_compression=4,
@@ -218,8 +218,8 @@ def test_serving_engine_no_quant_is_noop():
         num_experts_per_tok=2, moe_intermediate_size=64, hash_routed_layers=1,
         vocab_size=256,
     )
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
-    engine = DeepSeekV4Pro2BServingEngine(
+    model = Aether2BForCausalLM(cfg)
+    engine = Aether2BServingEngine(
         model, backend=PytorchAttentionBackend(), turbo_quant_bits=None
     )
     assert engine._polar_quant is None
@@ -233,12 +233,12 @@ def test_serving_engine_no_quant_is_noop():
 
 def test_serving_engine_8bit_quant_produces_int8():
     """With turbo_quant_bits=8, _quant_append produces int8 data + float32 scale."""
-    from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-    from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-    from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-    from deepseek_pipeline.serving import PytorchAttentionBackend
+    from aether_2b.serving import Aether2BServingEngine
+    from aether_2b.configuration import Aether2BConfig
+    from aether_2b.modeling import Aether2BForCausalLM
+    from aether_pipeline.serving import PytorchAttentionBackend
 
-    cfg = DeepSeekV4Pro2BConfig(
+    cfg = Aether2BConfig(
         num_hidden_layers=2, hidden_size=64, num_attention_heads=2,
         attention_head_dim=16, query_compression_dim=32, indexer_num_heads=2,
         indexer_head_dim=8, mhc_expansion=2, hca_compression=4, csa_compression=4,
@@ -247,8 +247,8 @@ def test_serving_engine_8bit_quant_produces_int8():
         num_experts_per_tok=2, moe_intermediate_size=64, hash_routed_layers=1,
         vocab_size=256,
     )
-    model = DeepSeekV4Pro2BForCausalLM(cfg)
-    engine = DeepSeekV4Pro2BServingEngine(
+    model = Aether2BForCausalLM(cfg)
+    engine = Aether2BServingEngine(
         model, backend=PytorchAttentionBackend(), turbo_quant_bits=8
     )
     assert engine._polar_quant is not None

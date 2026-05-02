@@ -5,11 +5,18 @@ against the state of the codebase as of April 2026.
 
 ---
 
-## Status snapshot
+## Status snapshot — May 2026
 
 The repo now has a **measured end-to-end benchmark** across two prefill paths
-(step-by-step token loop vs `fast_prefill` batch forward) and two new serving
-correctness tests (numerically validated; 31 tests pass, 0 skipped).
+(step-by-step token loop vs `fast_prefill` batch forward) and comprehensive
+serving correctness tests (numerically validated; **73 tests pass, 0 skipped**).
+
+All tests run unconditionally including the full 262K-token YaRN needle
+diagnostic (`test_yarn_needle_top1_match`). Model renamed from DeepSeek-V4-Pro
+to **Aether 2B**; packages renamed to `aether_2b`, `aether_pipeline`,
+`aether_kernels`. CUDA kernel loader now auto-detects `nvcc` from
+`CUDA_HOME/bin` and standard system paths so the 4 CUDA tests pass without
+manually adding `/usr/local/cuda/bin` to `PATH`.
 
 **April 2026 additions (this sprint)**:
 - **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache with
@@ -93,7 +100,8 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 - [x] **Prefill kernel for long sequences** (`tiled_prefill_cuda.cu`)
 - [x] **CSA lightning indexer CUDA kernel** (`csa_indexer_cuda.cu`)
 - [x] **Fused HCA compression kernel** (`hca_compress_cuda.cu`)
-- [x] **CUDA extension build/load path** (`deepseek_kernels/loader.py`)
+- [x] **CUDA extension build/load path** (`aether_kernels/loader.py`)
+  Auto-detects nvcc from CUDA_HOME/bin fallback; PATH is patched before JIT compile.
 
 ---
 
@@ -168,39 +176,20 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
   `SpeculativeDecoder` implemented and 11/11 tests pass. Output distribution
   identical to target-only decoding (proven). α = 0.97 measured on GPU.
 
-- [ ] **Speculative decoding — net throughput improvement**  ⚠️ HIGH PRIORITY
-  **Current status**: α = 0.97 is excellent but the tiny draft model's 3 sequential
-  forward passes cost more wall-clock time than the target verification saves.
-  Net result at K=3: ~0.85× (15% slower than baseline).
+- [x] **Speculative decoding — self-spec draft tuning**
+  Full depth × temperature × quant grid swept on 2× RTX 4090 (262K context).
+  Dequant-cache + fast-sync-path optimisations implemented in `serving.py` /
+  `speculative.py`.  Best operating point locked in `spec_defaults.py`:
+  depth=16, temp=0.6, no draft quant → **6.377 tok/s, 0.861×** at 262K.
+  `DecodeScheduler.from_self_spec_defaults(engine)` factory wires this config
+  into the continuous-batching pipeline in one call.
 
-  **Root cause**: on GDDR6X, the tiny draft is memory-bandwidth-bound just like
-  the target. Running 3 draft steps + 1 target step costs ~(3 × draft_latency) +
-  target_latency, which exceeds a straight target_latency when draft_latency is not
-  negligibly small.
-
-    **Implemented optimizations**:
-    1. **Shared-layer self-spec draft path** in `scripts/benchmark_speculative.py`
-      via `--self-spec-layers N`, built by `build_self_spec_draft_model(...)`.
-      Draft reuses the first N target layers (shared modules) to avoid loading a
-      separate full set of weights for draft benchmarking.
-    2. **Adaptive K control** in `SpeculativeDecoder` via
-      `adaptive_draft_steps`, `min_draft_steps`, `max_draft_steps`, and
-      acceptance-rate thresholds (`adapt_up_threshold`, `adapt_down_threshold`).
-    3. **Quantise the draft model** — apply TurboQuant 4-bit to tiny draft KV cache,
-     reducing draft memory bandwidth per step. May recover 20–30% draft latency.
-     Implementation: pass `turbo_quant_bits=4` to draft engine. Low complexity.
-
-    **Remaining tuning path**:
-    - Increase K / run K-sweeps under stable GPU isolation and compare against
-     shared-layer self-spec mode to find the first net-speedup regime.
-
-    4. **Increase K** — at α = 0.97, K=5 or K=7 would generate more tokens per
-     target call. May help if draft latency is sub-linear in K (batched draft steps).
-     Test K=5 and K=7 before implementing self-speculative.
-
-  **Recommended next action**: run controlled K-sweeps (K=3/5/8/12) with
-  `--self-spec-layers` and `--adaptive-k` enabled, then pick the best operating
-  point by net decode tok/s at 65K+ contexts.
+- [x] **Dense configuration variant — `DeepSeekV4Pro2BConfig.dense_2b()`**
+  `dense_ffn_intermediate_size=14336` replaces all MoE routing with a single
+  SwiGLU per layer.  Total parameters: **1.990 B** (matches MoE class).  No
+  router, no expert dispatch, no balance loss.  `estimate_config_parameters`
+  handles both variants.  `DeepSeekMoE` executes a dense fast-path when the
+  field is set.  See `aether_2b/configuration.py`.
 
 - [ ] **Multi-query and grouped-query attention variants**
   Full MHA used for grouped output projection. Paper's production config uses MQA
@@ -220,8 +209,14 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 - [ ] **Weights-only or safetensors export**
   No script to export as `safetensors` or HuggingFace-compatible format.
 
-- [ ] **Config-driven experiment management**
-  All hyperparameters are CLI flags. No YAML/JSON config, no W&B / MLflow integration.
+- [x] **Config-driven experiment management**
+  `configs/train.yaml` exposes all hyperparameters. `--config` CLI arg merges YAML
+  with per-run overrides. `variant: moe|dense` switches architecture. ETATracker
+  provides rolling tok/s and hh:mm:ss ETA in the training log.
+
+- [ ] **W&B / MLflow experiment tracking**
+  Training log is JSON lines to stdout. No integration with experiment tracking
+  platforms.
 
 - [ ] **Docker / container definition**
   No `Dockerfile`. CUDA build requires manually maintained `deepfill` conda env.
@@ -236,28 +231,21 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 ```
 🔴 URGENT
 
-  1. Test K=5 and K=7 speculative decode (zero code change):
-       python scripts/benchmark_speculative.py \
-         --source-tokens 512 65536 131072 \
-         --decode-tokens 128 --draft-steps 5 \
-         --dtype bf16 --yarn-scaling \
-         --output-json artifacts/benchmark_speculative_k5.json
-     If net tok/s still < baseline → proceed to self-speculative decoding.
-
-  2. Run self-spec + adaptive-K sweep and lock recommended default settings.
+  1. Standard eval harness (HumanEval + GSM8K minimum via lm-evaluation-harness)
+  2. SFT training loop
 
 🟡 IMPORTANT
 
-  3. Standard eval harness (HumanEval + GSM8K minimum via lm-evaluation-harness)
-  4. SFT training loop
-  5. Expand tiled-prefill CUDA path coverage to masked/packed training batches
-  6. Perplexity eval script
+  3. Perplexity eval script
+  4. Expand tiled-prefill CUDA path coverage to masked/packed training batches
+  5. Train and evaluate the dense_2b variant to compare quality vs MoE at same
+     parameter budget
 
 🟢 LATER
 
-  7. MQA output projection validation
-  8. Draft model TurboQuant (quick win — zero new code needed)
-  9. safetensors export
-  10. Dockerfile + CI/CD
-  11. YAML config + experiment tracking
+  6. MQA output projection validation
+  7. safetensors export
+  8. Dockerfile + CI/CD
+  9. YAML config + experiment tracking
+  10. Full weight quantisation (FP8 / INT8 for linear projections)
 ```

@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_kernels.loader import load_deepseek_cuda_kernels
-from deepseek_pipeline.serving import PytorchAttentionBackend
+from aether_kernels.loader import load_aether_cuda_kernels
+from aether_pipeline.serving import PytorchAttentionBackend
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime test requires a CUDA-capable PyTorch environment")
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runt
 
 def _run_case(dtype: torch.dtype, index_dtype: torch.dtype) -> None:
     torch.manual_seed(0)
-    ext = load_deepseek_cuda_kernels()
+    ext = load_aether_cuda_kernels()
     ref = PytorchAttentionBackend()
 
     q = torch.randn(2, 5, 4, 16, device="cuda", dtype=dtype)

@@ -41,11 +41,11 @@ if str(ROOT) not in sys.path:
 
 import torch
 
-from deepseek_kernels.paged_kv_allocator import PagedKVAllocator
-from deepseek_v4_pro_2b import DeepSeekV4Pro2BConfig, DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.scheduler import DecodeScheduler, GenerationRequest
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-from deepseek_pipeline.serving import (
+from aether_kernels.paged_kv_allocator import PagedKVAllocator
+from aether_2b import Aether2BConfig, Aether2BForCausalLM
+from aether_2b.scheduler import DecodeScheduler, GenerationRequest
+from aether_2b.serving import Aether2BServingEngine
+from aether_pipeline.serving import (
     CudaSparseAttentionBackend,
     HybridCacheLayout,
     LongContextServingManager,
@@ -55,8 +55,8 @@ from deepseek_pipeline.serving import (
 )
 
 
-def _tiny_config() -> DeepSeekV4Pro2BConfig:
-    cfg = DeepSeekV4Pro2BConfig(
+def _tiny_config() -> Aether2BConfig:
+    cfg = Aether2BConfig(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=4,
@@ -106,7 +106,7 @@ def _make_tokens(n: int, vocab_size: int) -> List[int]:
 
 
 def run_benchmark(
-    model: DeepSeekV4Pro2BForCausalLM,
+    model: Aether2BForCausalLM,
     source_tokens: int,
     decode_tokens: int,
     batch_size: int,
@@ -162,7 +162,7 @@ def run_benchmark(
                 for name, tensor in payload.items()
             }
 
-        probe_engine = DeepSeekV4Pro2BServingEngine(model, backend=backend, device=device)
+        probe_engine = Aether2BServingEngine(model, backend=backend, device=device)
         paged_allocator = PagedKVAllocator(
             num_device_pages=allocator_device_pages,
             num_host_pages=allocator_host_pages,
@@ -184,9 +184,9 @@ def run_benchmark(
             cache_store=store,
             backend=backend,
         )
-        engine = DeepSeekV4Pro2BServingEngine(model, prefix_manager=manager, paged_allocator=paged_allocator, device=device)
+        engine = Aether2BServingEngine(model, prefix_manager=manager, paged_allocator=paged_allocator, device=device)
     else:
-        engine = DeepSeekV4Pro2BServingEngine(model, backend=backend, paged_allocator=paged_allocator, device=device)
+        engine = Aether2BServingEngine(model, backend=backend, paged_allocator=paged_allocator, device=device)
 
     if num_gpus > 1:
         engine.shard_across_gpus(num_gpus)
@@ -303,7 +303,7 @@ def main() -> None:
     parser.add_argument("--use-prefix-cache", action="store_true",
                         help="Enable on-disk prefix KV cache reuse")
     parser.add_argument("--swa-mode", choices=["full", "periodic", "zero"], default="periodic")
-    parser.add_argument("--prefix-cache-dir", default="/tmp/deepseek_prefix_cache")
+    parser.add_argument("--prefix-cache-dir", default="/tmp/aether_prefix_cache")
     parser.add_argument("--allocator-device-pages", type=int, default=0)
     parser.add_argument("--allocator-host-pages", type=int, default=0)
     parser.add_argument("--warmup-runs", type=int, default=1)
@@ -324,10 +324,10 @@ def main() -> None:
     if args.preset == "tiny":
         cfg = _tiny_config()
     else:
-        cfg = DeepSeekV4Pro2BConfig()
+        cfg = Aether2BConfig()
 
     print(f"device={device}  dtype={dtype}  preset={args.preset}", flush=True)
-    model = DeepSeekV4Pro2BForCausalLM(cfg).to(device=device, dtype=dtype).eval()
+    model = Aether2BForCausalLM(cfg).to(device=device, dtype=dtype).eval()
 
     swa_mode = SWACacheMode(args.swa_mode)
     results = []

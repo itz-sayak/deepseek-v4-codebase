@@ -1,0 +1,61 @@
+{
+  "device": "cuda",
+  "dtype": "bfloat16",
+  "target_model": "2b",
+  "draft_model": "tiny",
+  "self_spec_layers": 16,
+  "adaptive_k": true,
+  "min_draft_steps": 1,
+  "max_draft_steps": 8,
+  "adapt_up_threshold": 0.9,
+  "adapt_down_threshold": 0.6,
+  "draft_steps": 6,
+  "temperature": 0.8,
+  "rope_scaling": "yarn",
+  "rope_scaling_factor": 4.0,
+  "budget_gib": 48.0,
+  "num_gpus": 2,
+  "budget_cap_context": 131072,
+  "budget_estimate_mib": {
+    "target_peak_mib": 16940.6884765625,
+    "draft_peak_mib": 16941.1884765625,
+    "combined_peak_mib": 33881.876953125
+  },
+  "budget_capped": false,
+  "source_tokens": [
+    262144
+  ],
+  "effective_source_tokens": [
+    262144
+  ],
+  "results": [
+    {
+      "requested_source_tokens": 262144,
+      "effective_source_tokens": 262144,
+      "budget_capped": false,
+      "prefill": {
+        "target_time_s": 240.94943206431344,
+        "draft_time_s": 130.547113138251,
+        "target_peak_mib": 16941.1884765625,
+        "draft_peak_mib": 18364.88134765625
+      },
+      "baseline_decode": {
+        "mean_s": 17.515775181353092,
+        "std_s": 4.4295838919654,
+        "mean_tok_s": 7.307698270543343,
+        "generated_tokens": 128,
+        "rounds": 3
+      },
+      "speculative_decode": {
+        "mean_s": 20.396767552942038,
+        "std_s": 4.451147852211931,
+        "mean_tok_s": 6.275504178187157,
+        "mean_acceptance_rate": 1.0,
+        "total_proposed_mean": 110,
+        "total_accepted_mean": 110,
+        "rounds": 3,
+        "matches_target_greedy": false
+      }
+    }
+  ]
+}

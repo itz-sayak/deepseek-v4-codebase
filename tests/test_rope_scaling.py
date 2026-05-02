@@ -10,13 +10,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_pipeline.serving import PytorchAttentionBackend
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM, get_rope_freqs
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
+from aether_pipeline.serving import PytorchAttentionBackend
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM, get_rope_freqs
+from aether_2b.serving import Aether2BServingEngine
 
 
-def _base_config(**overrides) -> DeepSeekV4Pro2BConfig:
+def _base_config(**overrides) -> Aether2BConfig:
     values = dict(
         vocab_size=128,
         hidden_size=64,
@@ -48,10 +48,10 @@ def _base_config(**overrides) -> DeepSeekV4Pro2BConfig:
         yarn_mscale=0.1,
     )
     values.update(overrides)
-    return DeepSeekV4Pro2BConfig(**values)
+    return Aether2BConfig(**values)
 
 
-def _base_rope_freqs(config: DeepSeekV4Pro2BConfig) -> torch.Tensor:
+def _base_rope_freqs(config: Aether2BConfig) -> torch.Tensor:
     half_dim = config.rope_dim // 2
     freqs = torch.arange(half_dim, dtype=torch.float32)
     return 1.0 / (config.rope_theta ** (freqs / half_dim))
@@ -116,7 +116,7 @@ def test_yarn_model_forward_runs_and_produces_finite_logits():
         rope_scaling_type="yarn",
         rope_scaling_factor=4.0,
     )
-    model = DeepSeekV4Pro2BForCausalLM(config).eval()
+    model = Aether2BForCausalLM(config).eval()
     input_ids = torch.randint(0, config.vocab_size, (1, 32))
     with torch.no_grad():
         output = model(input_ids)
@@ -125,10 +125,6 @@ def test_yarn_model_forward_runs_and_produces_finite_logits():
     assert output.balance_loss is not None
 
 
-@pytest.mark.skipif(
-    os.environ.get("DEEPSEEK_RUN_ROPE_NEEDLE") != "1",
-    reason="Long-context YaRN needle diagnostic is opt-in",
-)
 def test_yarn_needle_top1_match():
     torch.manual_seed(0)
     source_lengths = (65536, 131072)
@@ -156,12 +152,12 @@ def test_yarn_needle_top1_match():
         )
         yarn_cfg = replace(base_cfg, rope_scaling_type="yarn", rope_scaling_factor=max(1.0, ctx_length / base_cfg.max_position_embeddings))
 
-        base_model = DeepSeekV4Pro2BForCausalLM(base_cfg).eval()
-        yarn_model = DeepSeekV4Pro2BForCausalLM(yarn_cfg).eval()
+        base_model = Aether2BForCausalLM(base_cfg).eval()
+        yarn_model = Aether2BForCausalLM(yarn_cfg).eval()
         yarn_model.load_state_dict(base_model.state_dict())
 
-        base_engine = DeepSeekV4Pro2BServingEngine(base_model, backend=PytorchAttentionBackend(), device="cpu")
-        yarn_engine = DeepSeekV4Pro2BServingEngine(yarn_model, backend=PytorchAttentionBackend(), device="cpu")
+        base_engine = Aether2BServingEngine(base_model, backend=PytorchAttentionBackend(), device="cpu")
+        yarn_engine = Aether2BServingEngine(yarn_model, backend=PytorchAttentionBackend(), device="cpu")
 
         rng = torch.Generator().manual_seed(1234)
         haystack = torch.randint(3, base_cfg.vocab_size, (ctx_length,), generator=rng).tolist()

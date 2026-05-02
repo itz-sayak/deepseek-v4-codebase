@@ -1,0 +1,58 @@
+{
+  "sweep_config": {
+    "source_tokens": 262144,
+    "decode_tokens": 128,
+    "depths_swept": [
+      16
+    ],
+    "temperatures_swept": [
+      0.2
+    ],
+    "draft_steps": 6,
+    "adaptive_k": true,
+    "min_draft_steps": 1,
+    "max_draft_steps": 8,
+    "warmup_rounds": 1,
+    "benchmark_rounds": 3,
+    "num_gpus": 2,
+    "dtype": "bf16",
+    "yarn_scaling": true
+  },
+  "baseline_tok_s": 7.333,
+  "best_config": {
+    "depth": 16,
+    "temperature": 0.2,
+    "draft_quant_bits": 4,
+    "baseline_tok_s": 7.333,
+    "spec_tok_s": 6.094,
+    "speedup": 0.831,
+    "acceptance_rate": 1.0,
+    "total_proposed_mean": 110,
+    "total_accepted_mean": 110,
+    "spec_mean_s": 21.003,
+    "spec_std_s": 4.452,
+    "prefill_target_s": 233.94,
+    "prefill_draft_s": 137.71,
+    "target_peak_mib": 16940.7,
+    "draft_peak_mib": 17961.2
+  },
+  "grid": [
+    {
+      "depth": 16,
+      "temperature": 0.2,
+      "draft_quant_bits": 4,
+      "baseline_tok_s": 7.333,
+      "spec_tok_s": 6.094,
+      "speedup": 0.831,
+      "acceptance_rate": 1.0,
+      "total_proposed_mean": 110,
+      "total_accepted_mean": 110,
+      "spec_mean_s": 21.003,
+      "spec_std_s": 4.452,
+      "prefill_target_s": 233.94,
+      "prefill_draft_s": 137.71,
+      "target_peak_mib": 16940.7,
+      "draft_peak_mib": 17961.2
+    }
+  ]
+}

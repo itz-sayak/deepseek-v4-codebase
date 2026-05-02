@@ -8,17 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepseek_pipeline.serving import CudaSparseAttentionBackend, PytorchAttentionBackend
-from deepseek_v4_pro_2b.configuration import DeepSeekV4Pro2BConfig
-from deepseek_v4_pro_2b.modeling import DeepSeekV4Pro2BForCausalLM
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
+from aether_pipeline.serving import CudaSparseAttentionBackend, PytorchAttentionBackend
+from aether_2b.configuration import Aether2BConfig
+from aether_2b.modeling import Aether2BForCausalLM
+from aether_2b.serving import Aether2BServingEngine
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA serving test requires a CUDA-capable PyTorch environment")
 
 
 def tiny_config():
-    return DeepSeekV4Pro2BConfig(
+    return Aether2BConfig(
         vocab_size=128,
         hidden_size=64,
         num_hidden_layers=4,
@@ -46,9 +46,9 @@ def tiny_config():
 
 def test_cuda_backend_matches_pytorch_serving_engine():
     torch.manual_seed(0)
-    model = DeepSeekV4Pro2BForCausalLM(tiny_config()).eval().to("cuda")
-    cuda_engine = DeepSeekV4Pro2BServingEngine(model, backend=CudaSparseAttentionBackend(), device="cuda")
-    ref_engine = DeepSeekV4Pro2BServingEngine(model, backend=PytorchAttentionBackend(), device="cuda")
+    model = Aether2BForCausalLM(tiny_config()).eval().to("cuda")
+    cuda_engine = Aether2BServingEngine(model, backend=CudaSparseAttentionBackend(), device="cuda")
+    ref_engine = Aether2BServingEngine(model, backend=PytorchAttentionBackend(), device="cuda")
     tokens = [1, 7, 3, 9, 2, 11, 5, 4, 8]
 
     ref_state = ref_engine.prefill(tokens)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speculative decoding benchmark for DeepSeek-V4-Pro-2B.
+"""Speculative decoding benchmark for Aether-2B.
 
 Measures greedy target-only decode versus greedy speculative decode using a
 separate draft model. The benchmark is designed to exercise the real draft-path
@@ -31,14 +31,14 @@ if str(ROOT) not in sys.path:
 
 import torch
 
-from deepseek_v4_pro_2b import (
-    DeepSeekV4Pro2BConfig,
-    DeepSeekV4Pro2BForCausalLM,
+from aether_2b import (
+    Aether2BConfig,
+    Aether2BForCausalLM,
     build_self_spec_draft_model,
 )
-from deepseek_v4_pro_2b.serving import DeepSeekV4Pro2BServingEngine
-from deepseek_v4_pro_2b.speculative import SpeculativeDecoder, SpecDecodeSummary
-from deepseek_pipeline.serving import CudaSparseAttentionBackend, PytorchAttentionBackend
+from aether_2b.serving import Aether2BServingEngine
+from aether_2b.speculative import SpeculativeDecoder, SpecDecodeSummary
+from aether_pipeline.serving import CudaSparseAttentionBackend, PytorchAttentionBackend
 
 
 def _bytes_to_mib(value: int) -> float:
@@ -70,8 +70,8 @@ def _backend_from_name(name: str):
     raise ValueError(f"Unsupported backend '{name}'")
 
 
-def _tiny_config(vocab_size: int) -> DeepSeekV4Pro2BConfig:
-    return DeepSeekV4Pro2BConfig(
+def _tiny_config(vocab_size: int) -> Aether2BConfig:
+    return Aether2BConfig(
         vocab_size=vocab_size,
         hidden_size=64,
         num_hidden_layers=4,
@@ -97,15 +97,15 @@ def _tiny_config(vocab_size: int) -> DeepSeekV4Pro2BConfig:
     )
 
 
-def _build_config(model_kind: str, vocab_size: Optional[int] = None) -> DeepSeekV4Pro2BConfig:
+def _build_config(model_kind: str, vocab_size: Optional[int] = None) -> Aether2BConfig:
     if model_kind == "2b":
-        return DeepSeekV4Pro2BConfig()
+        return Aether2BConfig()
     if model_kind == "tiny":
-        return _tiny_config(vocab_size or DeepSeekV4Pro2BConfig().vocab_size)
+        return _tiny_config(vocab_size or Aether2BConfig().vocab_size)
     raise ValueError(f"Unsupported model kind '{model_kind}'")
 
 
-def _apply_yarn_scaling(config: DeepSeekV4Pro2BConfig, scale_factor: float) -> None:
+def _apply_yarn_scaling(config: Aether2BConfig, scale_factor: float) -> None:
     config.rope_scaling_type = "yarn"
     config.rope_scaling_factor = scale_factor
 
@@ -116,7 +116,7 @@ def _make_prompt_tokens(length: int, vocab_size: int, seed: int) -> List[int]:
 
 
 def _greedy_decode_from_state(
-    engine: DeepSeekV4Pro2BServingEngine,
+    engine: Aether2BServingEngine,
     state,
     max_new_tokens: int,
 ) -> Tuple[List[int], float, object]:
@@ -155,7 +155,10 @@ def _speculative_decode_from_states(
         draft_steps = min(decoder.draft_steps, remaining)
         original_steps = decoder.draft_steps
         decoder.draft_steps = draft_steps
-        result, target_state, draft_state = decoder._spec_round(target_state, draft_state, last_token)
+        if getattr(decoder, "_shared_layer_fusion_depth", 0) > 0:
+            result, target_state, draft_state = decoder._spec_round_shared_fused(target_state, draft_state, last_token)
+        else:
+            result, target_state, draft_state = decoder._spec_round(target_state, draft_state, last_token)
         decoder.draft_steps = original_steps
 
         new_tokens_in_round = result.accepted_tokens + [result.bonus_token]
@@ -164,7 +167,7 @@ def _speculative_decode_from_states(
             new_tokens += 1
             if new_tokens >= max_new_tokens:
                 break
-        last_token = new_tokens_in_round[-1]
+        last_token = output_ids[-1]
 
         summary.total_proposed += result.draft_proposed
         summary.total_accepted += len(result.accepted_tokens)
@@ -176,7 +179,7 @@ def _speculative_decode_from_states(
 
 
 def _prefill_and_peak(
-    engine: DeepSeekV4Pro2BServingEngine,
+    engine: Aether2BServingEngine,
     prompt_ids: Sequence[int],
     mhc_chunk_size: int,
 ) -> Tuple[object, Optional[float], float]:
@@ -194,7 +197,7 @@ def _prefill_and_peak(
 
 
 def _measure_decode_rounds(
-    engine: DeepSeekV4Pro2BServingEngine,
+    engine: Aether2BServingEngine,
     prefilled_state,
     decode_tokens: int,
     rounds: int,
@@ -268,8 +271,8 @@ def _measure_speculative_rounds(
 
 
 def _estimate_combined_peak_mib(
-    target_engine: DeepSeekV4Pro2BServingEngine,
-    draft_engine: DeepSeekV4Pro2BServingEngine,
+    target_engine: Aether2BServingEngine,
+    draft_engine: Aether2BServingEngine,
     prompt_ids: Sequence[int],
     mhc_chunk_size: int,
 ) -> Dict[str, float]:
@@ -305,6 +308,7 @@ def main() -> None:
     parser.add_argument("--source-tokens", type=int, nargs="+", default=[65536, 131072, 262144])
     parser.add_argument("--decode-tokens", type=int, default=128)
     parser.add_argument("--draft-steps", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--benchmark-rounds", type=int, default=10)
     parser.add_argument("--mhc-chunk-size", type=int, default=4096)
@@ -318,6 +322,10 @@ def main() -> None:
     parser.add_argument("--adapt-up-threshold", type=float, default=0.90)
     parser.add_argument("--adapt-down-threshold", type=float, default=0.60)
     parser.add_argument("--gpu-budget-gib", type=float, default=48.0)
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of CUDA GPUs for model layer sharding")
+    parser.add_argument("--draft-quant-bits", type=int, default=None, choices=[4, 8],
+                        help="TurboQuant KV-cache quantisation for the draft engine (4 or 8 bit). "
+                             "Reduces draft cache HBM bandwidth; recommended at long context.")
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
@@ -330,6 +338,9 @@ def main() -> None:
     target_cfg = _build_config(args.target_model)
     draft_cfg = _build_config(args.draft_model if args.draft_model != "self" else args.target_model, vocab_size=target_cfg.vocab_size)
 
+    if args.self_spec_layers is not None and args.draft_model == "self":
+        raise ValueError("--self-spec-layers cannot be combined with --draft-model self")
+
     max_requested_tokens = max(args.source_tokens)
     rope_scaling_factor = max(1.0, max_requested_tokens / target_cfg.max_position_embeddings)
     if args.yarn_scaling:
@@ -337,21 +348,37 @@ def main() -> None:
         _apply_yarn_scaling(draft_cfg, rope_scaling_factor)
 
     torch.manual_seed(0)
-    target_model = DeepSeekV4Pro2BForCausalLM(target_cfg).eval().to(device=device, dtype=dtype)
+    target_model = Aether2BForCausalLM(target_cfg).eval().to(device=device, dtype=dtype)
     if args.draft_model == "self":
         draft_model = target_model
     elif args.self_spec_layers is not None:
         draft_model = build_self_spec_draft_model(target_model, args.self_spec_layers).to(device=device, dtype=dtype)
     else:
-        draft_model = DeepSeekV4Pro2BForCausalLM(draft_cfg).eval().to(device=device, dtype=dtype)
+        draft_model = Aether2BForCausalLM(draft_cfg).eval().to(device=device, dtype=dtype)
 
-    target_engine = DeepSeekV4Pro2BServingEngine(target_model, backend=backend, device=device.type)
-    draft_engine = target_engine if args.draft_model == "self" else DeepSeekV4Pro2BServingEngine(draft_model, backend=backend, device=device.type)
+    target_engine = Aether2BServingEngine(target_model, backend=backend, device=device.type)
+    draft_engine = target_engine if args.draft_model == "self" else Aether2BServingEngine(
+        draft_model, backend=backend, device=device.type,
+        turbo_quant_bits=args.draft_quant_bits,
+    )
+
+    if device.type == "cuda" and args.num_gpus > 1:
+        target_engine.shard_across_gpus(args.num_gpus)
+        # For shared-layer self-spec, draft model reuses target layer module
+        # objects. Re-sharding draft independently would move shared modules to
+        # conflicting devices and break target prefill.
+        if draft_engine is not target_engine and args.self_spec_layers is None:
+            draft_engine.shard_across_gpus(args.num_gpus)
+        elif draft_engine is not target_engine and args.self_spec_layers is not None:
+            target_layer_devices = getattr(target_engine.model.model, "_layer_devices", None)
+            if target_layer_devices is not None:
+                draft_engine.model.model._layer_devices = list(target_layer_devices[: len(draft_engine.model.model.layers)])
+
     decoder = SpeculativeDecoder(
         target_engine,
         draft_engine,
         draft_steps=args.draft_steps,
-        temperature=0.0,
+        temperature=args.temperature,
         adaptive_draft_steps=args.adaptive_k,
         min_draft_steps=args.min_draft_steps,
         max_draft_steps=args.max_draft_steps,
@@ -445,9 +472,11 @@ def main() -> None:
         "adapt_up_threshold": args.adapt_up_threshold,
         "adapt_down_threshold": args.adapt_down_threshold,
         "draft_steps": args.draft_steps,
+        "temperature": args.temperature,
         "rope_scaling": "yarn" if args.yarn_scaling else "none",
         "rope_scaling_factor": rope_scaling_factor if args.yarn_scaling else 1.0,
         "budget_gib": args.gpu_budget_gib,
+        "num_gpus": args.num_gpus,
         "budget_cap_context": budget_cap_context,
         "budget_estimate_mib": budget_report,
         "budget_capped": budget_capped,

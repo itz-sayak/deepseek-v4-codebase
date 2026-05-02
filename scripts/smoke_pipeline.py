@@ -52,7 +52,7 @@ def main():
         [
             sys.executable,
             "-m",
-            "deepseek_pipeline.preprocess",
+            "aether_pipeline.preprocess",
             "--dataset-root",
             str(ARTIFACTS / "datasets"),
             "--output-dir",

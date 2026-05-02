@@ -1,0 +1,102 @@
+# ============================================================
+# Aether 2B  —  Training Configuration
+# ============================================================
+# Edit this file to control every aspect of a training run.
+# Pass it to the trainer with:
+#
+#   python train_end_to_end.py --config configs/train.yaml
+#
+# All values shown here are the defaults.  Override any field
+# on the command line:
+#
+#   python train_end_to_end.py --config configs/train.yaml \
+#       --batch-size 4 --grad-accum 8
+#
+# ─────────────────────────────────────────────────────────────
+# VARIANT SWITCH  ←  change this one line to switch architectures
+# ─────────────────────────────────────────────────────────────
+#   "moe"   — Mixture-of-Experts  (2.111 B total params,
+#              16 routed + 1 shared expert, 28 layers)
+#   "dense" — Pure-dense SwiGLU   (2.135 B total params,
+#              ffn_width=14336, 28 layers, no routing overhead)
+variant: moe
+
+# ─────────────────────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────────────────────
+data_dir: ./artifacts/tokenized
+output_dir: ./artifacts/checkpoints
+
+# ─────────────────────────────────────────────────────────────
+# Tokenizer
+# ─────────────────────────────────────────────────────────────
+tokenizer_name: deepseek-ai/DeepSeek-V3.2
+# tokenizer_cache_dir is read from HF_HOME env-var when omitted
+tokenizer_cache_dir: null
+
+# ─────────────────────────────────────────────────────────────
+# Sequence & batch
+# ─────────────────────────────────────────────────────────────
+seq_len: 2048       # tokens per sample
+batch_size: 1       # micro-batch per GPU
+grad_accum: 8       # gradient accumulation steps → effective batch = batch_size * grad_accum * world_size
+sequence_packing: true   # pack documents end-to-end (no wasted padding)
+
+# ─────────────────────────────────────────────────────────────
+# Training duration
+# ─────────────────────────────────────────────────────────────
+epochs: 2
+max_steps: null     # hard step cap; overrides epochs if set
+
+# ─────────────────────────────────────────────────────────────
+# Optimisers  (AdamW for embeddings/norms, Muon for weight matrices)
+# ─────────────────────────────────────────────────────────────
+learning_rate: 2.2e-4
+muon_lr:       2.0e-2
+weight_decay:  0.1
+warmup_steps:  2000      # linear LR ramp-up
+lr_min_ratio:  0.1       # cosine floor as fraction of peak LR
+
+# ─────────────────────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────────────────────
+eval_interval: 1000   # run val-loss eval every N *optimizer* steps
+
+# ─────────────────────────────────────────────────────────────
+# Checkpointing
+# ─────────────────────────────────────────────────────────────
+# Only TWO checkpoint files are kept at any time:
+#   checkpoint-latest.pt  — most recent state (always overwritten)
+#   best.pth              — best validation-loss state (only overwritten
+#                           when val_loss improves)
+# Checkpoint is written every `checkpoint_interval` optimizer steps.
+checkpoint_interval: 1000
+
+# ─────────────────────────────────────────────────────────────
+# Resume
+# ─────────────────────────────────────────────────────────────
+resume_from: null     # explicit checkpoint path; null = auto-detect latest
+auto_resume: true     # automatically load checkpoint-latest.pt if present
+
+# ─────────────────────────────────────────────────────────────
+# Hardware
+# ─────────────────────────────────────────────────────────────
+device: cuda          # "cuda" or "cpu"
+dtype: bfloat16       # "bfloat16" or "float32"
+fsdp: false           # FSDP multi-GPU (launch with torchrun, WORLD_SIZE>1)
+gradient_checkpointing: false   # trade compute for memory (slower, less HBM)
+
+# ─────────────────────────────────────────────────────────────
+# ETA reporting
+# ─────────────────────────────────────────────────────────────
+# ETA is printed alongside every training-step log line.
+# The rolling average window controls how many recent steps are
+# used to estimate throughput (tokens/s and steps/s).
+eta_window: 50        # steps to average for ETA estimate
+
+# ─────────────────────────────────────────────────────────────
+# Preset override (overrides the variant field above)
+# ─────────────────────────────────────────────────────────────
+# "2b"   — full-scale model (uses variant: moe or dense above)
+# "tiny" — miniature model for smoke tests / CI
+preset: 2b

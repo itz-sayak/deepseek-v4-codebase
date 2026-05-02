@@ -1,9 +1,27 @@
-torch
-transformers
-datasets
-huggingface_hub
-sentencepiece
-pyarrow
-tqdm
-pytest
-ninja
+# Aether 2B — Python dependencies
+# Install with: uv pip install -r requirements.txt
+
+# ── Core framework ──────────────────────────────────────────────────────────
+torch>=2.5.1                  # tested with 2.5.1+cu121 (CUDA 12.1)
+numpy>=1.26.4,<2.0            # 2.x breaks several tensor ops
+
+# ── Hugging Face ecosystem ───────────────────────────────────────────────────
+transformers>=5.6.2            # tokenizer + model utilities
+datasets>=4.8.4                # Arrow-backed dataset loading
+huggingface_hub>=1.8.0         # model/dataset hub access
+sentencepiece>=0.2.1           # SentencePiece tokenizer backend
+
+# ── Data I/O ─────────────────────────────────────────────────────────────────
+pyarrow>=24.0.0                # fast columnar storage for datasets
+
+# ── Training utilities ───────────────────────────────────────────────────────
+tqdm>=4.67.3                   # progress bars
+
+# ── Config ───────────────────────────────────────────────────────────────────
+pyyaml>=6.0.3                  # YAML config file support (configs/train.yaml)
+
+# ── CUDA kernel build ────────────────────────────────────────────────────────
+ninja>=1.11                    # JIT C++/CUDA extension compilation via torch
+
+# ── Dev / test ───────────────────────────────────────────────────────────────
+pytest>=9.0.3
