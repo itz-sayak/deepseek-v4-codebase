@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
 from typing import Dict, Iterable, Iterator, List, Optional
 
 from datasets import Dataset, load_dataset
-from huggingface_hub import login
+from huggingface_hub import HfFileSystem, list_repo_files
+import zstandard
 
 from .manifest import DPO_SOURCES, LARGE_PRETRAIN_SOURCES, NEW_PRETRAIN_SOURCES, PRETRAIN_SOURCES, SFT_SOURCES, SOURCE_INDEX, SourceSpec
 from .tokenizer import load_aether_tokenizer
@@ -18,9 +20,7 @@ SHARD_DIR_NAME = "_shards"
 
 
 def _maybe_login_from_env() -> None:
-    token = os.environ.get("HF_TOKEN")
-    if token:
-        login(token=token, add_to_git_credential=False)
+    return None
 
 
 def _atomic_write_json(path: str, payload: Dict[str, object]) -> None:
@@ -56,22 +56,23 @@ def _write_resume_state(
     max_samples: Optional[int],
     shard_size: int,
     completed: bool,
+    source_cursor: Optional[Dict[str, object]] = None,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    _atomic_write_json(
-        os.path.join(output_dir, RESUME_STATE_NAME),
-        {
-            "source": spec.name,
-            "stage": spec.stage,
-            "hf_name": spec.hf_name,
-            "raw_items_seen": raw_items_seen,
-            "kept_records": kept_records,
-            "next_shard_index": next_shard_index,
-            "max_samples": max_samples,
-            "shard_size": shard_size,
-            "completed": completed,
-        },
-    )
+    payload: Dict[str, object] = {
+        "source": spec.name,
+        "stage": spec.stage,
+        "hf_name": spec.hf_name,
+        "raw_items_seen": raw_items_seen,
+        "kept_records": kept_records,
+        "next_shard_index": next_shard_index,
+        "max_samples": max_samples,
+        "shard_size": shard_size,
+        "completed": completed,
+    }
+    if source_cursor is not None:
+        payload["source_cursor"] = source_cursor
+    _atomic_write_json(os.path.join(output_dir, RESUME_STATE_NAME), payload)
 
 
 def _flush_shard(output_dir: str, shard_index: int, records: List[Dict[str, object]]) -> str:
@@ -85,13 +86,63 @@ def _flush_shard(output_dir: str, shard_index: int, records: List[Dict[str, obje
     return shard_path
 
 
-def _iter_source_items(spec: SourceSpec, start_raw_index: int = 0) -> Iterator[tuple[int, Dict[str, object]]]:
+def _iter_dclm_items(
+    spec: SourceSpec,
+    start_raw_index: int = 0,
+    start_cursor: Optional[Dict[str, object]] = None,
+) -> Iterator[tuple[int, Dict[str, object], Optional[Dict[str, object]]]]:
+    _maybe_login_from_env()
+    token = os.environ.get("HF_TOKEN") or None
+    repo_files = sorted(path for path in list_repo_files(spec.hf_name, repo_type="dataset", token=token) if path.endswith(".jsonl.zst"))
+    fs = HfFileSystem(token=token)
+    cursor_repo_file = None
+    cursor_line_number = 0
+    if start_cursor:
+        cursor_repo_file = str(start_cursor.get("repo_file") or "") or None
+        cursor_line_number = int(start_cursor.get("line_number") or 0)
+
+    raw_index = start_raw_index if cursor_repo_file else 0
+
+    for repo_file in repo_files:
+        if cursor_repo_file and repo_file < cursor_repo_file:
+            continue
+        with fs.open(f"datasets/{spec.hf_name}/{repo_file}", "rb") as handle:
+            with zstandard.ZstdDecompressor().stream_reader(handle) as reader:
+                text_stream = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+                for line_number, line in enumerate(text_stream, start=1):
+                    if not line.strip():
+                        continue
+                    if cursor_repo_file == repo_file and line_number <= cursor_line_number:
+                        continue
+                    current_raw_index = raw_index
+                    raw_index += 1
+                    if current_raw_index < start_raw_index:
+                        continue
+                    cursor = {"repo_file": repo_file, "line_number": line_number}
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        print(f"[skip] malformed json file={repo_file} line={line_number}: {exc}", flush=True)
+                        yield current_raw_index, {}, cursor
+                        continue
+                    yield current_raw_index, item, cursor
+
+
+def _iter_source_items(
+    spec: SourceSpec,
+    start_raw_index: int = 0,
+    start_cursor: Optional[Dict[str, object]] = None,
+) -> Iterator[tuple[int, Dict[str, object], Optional[Dict[str, object]]]]:
+    if spec.name == "dclm_baseline":
+        yield from _iter_dclm_items(spec, start_raw_index=start_raw_index, start_cursor=start_cursor)
+        return
+
     _maybe_login_from_env()
     ds = load_dataset(spec.hf_name, streaming=True, **spec.hf_kwargs())
     for raw_index, item in enumerate(ds):
         if raw_index < start_raw_index:
             continue
-        yield raw_index, item
+        yield raw_index, item, None
 
 
 def _save_records_incrementally(spec: SourceSpec, output_dir: str, max_samples: Optional[int], shard_size: int) -> str:
@@ -107,6 +158,7 @@ def _save_records_incrementally(spec: SourceSpec, output_dir: str, max_samples: 
     raw_items_seen = int(state.get("raw_items_seen", 0))
     kept_records = int(state.get("kept_records", 0))
     next_shard_index = int(state.get("next_shard_index", 0))
+    source_cursor = state.get("source_cursor") if isinstance(state.get("source_cursor"), dict) else None
     if max_samples is not None and kept_records >= max_samples:
         _write_resume_state(
             output_dir,
@@ -117,18 +169,16 @@ def _save_records_incrementally(spec: SourceSpec, output_dir: str, max_samples: 
             max_samples=max_samples,
             shard_size=shard_size,
             completed=True,
+            source_cursor=source_cursor,
         )
         return output_dir
 
     buffer: List[Dict[str, object]] = []
+    current_cursor = source_cursor
+    last_state_write_raw = raw_items_seen
 
-    def flush_buffer() -> None:
-        nonlocal next_shard_index, buffer
-        if not buffer:
-            return
-        _flush_shard(output_dir, next_shard_index, buffer)
-        next_shard_index += 1
-        buffer = []
+    def write_state(*, completed: bool) -> None:
+        nonlocal last_state_write_raw
         _write_resume_state(
             output_dir,
             spec,
@@ -137,12 +187,27 @@ def _save_records_incrementally(spec: SourceSpec, output_dir: str, max_samples: 
             next_shard_index=next_shard_index,
             max_samples=max_samples,
             shard_size=shard_size,
-            completed=False,
+            completed=completed,
+            source_cursor=current_cursor,
         )
+        last_state_write_raw = raw_items_seen
+
+    def flush_buffer() -> None:
+        nonlocal next_shard_index, buffer
+        if not buffer:
+            return
+        _flush_shard(output_dir, next_shard_index, buffer)
+        next_shard_index += 1
+        buffer = []
+        write_state(completed=False)
 
     try:
-        for raw_index, item in _iter_source_items(spec, start_raw_index=raw_items_seen):
+        for raw_index, item, item_cursor in _iter_source_items(spec, start_raw_index=raw_items_seen, start_cursor=source_cursor):
             raw_items_seen = raw_index + 1
+            current_cursor = item_cursor or current_cursor
+            # Persist cursor progress during long catch-up scans so retries resume quickly.
+            if current_cursor is not None and raw_items_seen - last_state_write_raw >= 10000:
+                write_state(completed=False)
             record = normalize_record(spec, item)
             if record is None:
                 continue
@@ -158,16 +223,7 @@ def _save_records_incrementally(spec: SourceSpec, output_dir: str, max_samples: 
         raise
 
     flush_buffer()
-    _write_resume_state(
-        output_dir,
-        spec,
-        raw_items_seen=raw_items_seen,
-        kept_records=kept_records,
-        next_shard_index=next_shard_index,
-        max_samples=max_samples,
-        shard_size=shard_size,
-        completed=True,
-    )
+    write_state(completed=True)
     return output_dir
 
 
