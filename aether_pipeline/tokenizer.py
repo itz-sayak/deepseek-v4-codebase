@@ -4,10 +4,10 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional
 
-from transformers import AutoTokenizer, LlamaTokenizerFast
+from transformers import AutoTokenizer
 
 
-DEFAULT_AETHER_TOKENIZER = os.environ.get("AETHER_TOKENIZER_NAME", "deepseek-ai/DeepSeek-V3.2")
+DEFAULT_AETHER_TOKENIZER = os.environ.get("AETHER_TOKENIZER_NAME", "deepseek-ai/DeepSeek-V3")
 
 
 @dataclass
@@ -17,35 +17,19 @@ class AetherTokenizer:
     trust_remote_code: bool = True
 
     def __post_init__(self) -> None:
-        if "deepseek-ai/DeepSeek-V3.2" in self.name_or_path or "deepseek-ai/DeepSeek-V3.1-Base" in self.name_or_path:
-            self._tok = LlamaTokenizerFast.from_pretrained(
-                self.name_or_path,
-                cache_dir=self.cache_dir,
-                trust_remote_code=self.trust_remote_code,
-            )
-        else:
-            try:
-                self._tok = AutoTokenizer.from_pretrained(
-                    self.name_or_path,
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=self.trust_remote_code,
-                )
-            except Exception:
-                # The base tokenizer exposes a LlamaTokenizerFast tokenizer, but some
-                # transformers versions fail when AutoTokenizer tries to parse the
-                # model config first. Falling back to the tokenizer class avoids
-                # binding tokenizer loading to architecture support.
-                self._tok = LlamaTokenizerFast.from_pretrained(
-                    self.name_or_path,
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=self.trust_remote_code,
-                )
+        self._tok = AutoTokenizer.from_pretrained(
+            self.name_or_path,
+            cache_dir=self.cache_dir,
+            trust_remote_code=self.trust_remote_code,
+        )
         if self._tok.pad_token_id is None:
             self._tok.pad_token = self._tok.eos_token
         self.vocab_size = len(self._tok)
-        self.bos_token_id = self._tok.bos_token_id
-        self.eos_token_id = self._tok.eos_token_id
-        self.pad_token_id = self._tok.pad_token_id
+        # Use canonical DeepSeek-V3 special token IDs per spec; fall back to
+        # whatever the loaded tokenizer reports if they differ.
+        self.bos_token_id = self._tok.bos_token_id or 100000
+        self.eos_token_id = self._tok.eos_token_id or 100001
+        self.pad_token_id = self._tok.pad_token_id or self.eos_token_id
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
         return self._tok.encode(text, add_special_tokens=add_special_tokens)

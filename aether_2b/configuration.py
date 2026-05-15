@@ -13,7 +13,7 @@ class Aether2BConfig:
     2B total-parameter class by reducing depth, hidden width, heads, and experts.
     """
 
-    vocab_size: int = 65536
+    vocab_size: int = 128815
     hidden_size: int = 1536
     num_hidden_layers: int = 28
     num_attention_heads: int = 16
@@ -52,9 +52,9 @@ class Aether2BConfig:
     mtp_loss_weight: float = 0.3
     tie_word_embeddings: bool = True
     initializer_range: float = 0.02
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
+    pad_token_id: int = 1
+    bos_token_id: int = 0
+    eos_token_id: int = 1
     # Dense FFN mode: when > 0 every layer uses a single SwiGLU of this width
     # instead of MoE routing.  Set via Aether2BConfig.dense_2b().
     dense_ffn_intermediate_size: int = 0

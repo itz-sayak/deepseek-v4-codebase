@@ -13,6 +13,7 @@ sentencepiece>=0.2.1           # SentencePiece tokenizer backend
 
 # ── Data I/O ─────────────────────────────────────────────────────────────────
 pyarrow>=24.0.0                # fast columnar storage for datasets
+zstandard>=0.23.0              # enables reading .zst-compressed dataset shards
 
 # ── Training utilities ───────────────────────────────────────────────────────
 tqdm>=4.67.3                   # progress bars
