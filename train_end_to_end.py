@@ -40,7 +40,9 @@ def _fmt_ppl(p: float) -> str:
 def _pp_header(hdr: dict) -> str:
     sep = "─" * 68
     name = f"{hdr.get('variant', '')}-{hdr.get('preset', '')}  ·  {hdr.get('total_params_B', '?')}B params"
-    info = f"{hdr.get('total_steps', 0):,} steps  ·  ckpt every {hdr.get('checkpoint_interval', '?')}"
+    total_B = hdr.get('total_tokens_B')
+    tok_s = f"  ·  {total_B:.1f}B tokens" if total_B is not None else ""
+    info = f"{hdr.get('total_steps', 0):,} steps{tok_s}  ·  ckpt every {hdr.get('checkpoint_interval', '?')}"
     return f"\n{sep}\n  {name}\n  {info}\n{sep}"
 
 def _pp_step(e: dict) -> str:
@@ -54,13 +56,15 @@ def _pp_step(e: dict) -> str:
     elapsed = e.get("elapsed", "?")
     eta     = e.get("eta", "")
     tps     = e.get("tok_per_sec")
+    tokens_B = e.get("tokens_B")
 
     step_s  = f"[{step:>9,}/{total:,}  {pct:.3f}%]"
     train_s = f"loss={loss:.4f}" + (f"  ppl={_fmt_ppl(ppl)}" if ppl is not None else "")
     val_s   = (f"  │  val={val:.4f}" + (f"  ppl={_fmt_ppl(vppl)}" if vppl is not None else "")) if val is not None else ""
     tps_s   = f"  │  {tps:.0f} tok/s" if tps is not None else ""
+    tok_s   = f"  │  {tokens_B:.3f}B tok" if tokens_B is not None else ""
     eta_s   = f"  eta {eta}" if eta and eta != "--:--:--" else ""
-    return f"{step_s}  {train_s}{val_s}  │  lr×{lr:.4f}{tps_s}  │  {elapsed}{eta_s}"
+    return f"{step_s}  {train_s}{val_s}  │  lr×{lr:.4f}{tps_s}{tok_s}  │  {elapsed}{eta_s}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -763,12 +767,14 @@ def train(cfg: TrainConfig) -> None:
     if is_main:
         from aether_2b.sizing import estimate_config_parameters
         total_params = estimate_config_parameters(model_cfg)
+        total_tokens = total_steps * cfg.grad_accum * cfg.batch_size * cfg.seq_len * world_size
         hdr = {
             "status": "train_start",
             "variant": cfg.variant,
             "preset": cfg.preset,
             "total_params_B": round(total_params / 1e9, 3),
             "total_steps": total_steps,
+            "total_tokens_B": round(total_tokens / 1e9, 1),
             "checkpoint_interval": cfg.checkpoint_interval,
             "checkpoint_dir": cfg.output_dir,
         }
@@ -806,7 +812,7 @@ def train(cfg: TrainConfig) -> None:
         for _ in range(micro_batches_this_step):
             batch, consumed_examples, next_sample_index, epoch_increment = _next_batch(train_set, cfg.batch_size, next_sample_index)
             epoch += epoch_increment
-            tokens_processed += consumed_examples * cfg.seq_len
+            tokens_processed += consumed_examples * cfg.seq_len * world_size
             batch = {k: v.to(cfg.device) for k, v in batch.items()}
             with dtype_ctx:
                 out = model(**batch)
@@ -843,6 +849,7 @@ def train(cfg: TrainConfig) -> None:
             tps = eta.tokens_per_sec
             if tps is not None:
                 log_entry["tok_per_sec"] = round(tps, 1)
+            log_entry["tokens_B"] = round(tokens_processed / 1e9, 4)
             log_entry["train_ppl"] = round(math.exp(min(accum_loss, 20)), 4)
             if val_loss is not None:
                 log_entry["val_loss"] = round(val_loss, 6)
