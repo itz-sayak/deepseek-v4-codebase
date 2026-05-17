@@ -250,25 +250,230 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 
 ---
 
+## 10  Context Length Extension — Staged Plan
+
+This section is the agent's detailed playbook for extending training context from
+the current 4K to 262K. Do not start any stage until the stated trigger condition
+is met.
+
+---
+
+### Why staged extension?
+
+Training directly at 262K is infeasible for three reasons:
+1. **Data scarcity**: documents genuinely longer than 32K are rare; the model
+   learns nothing useful from padding-dominated batches.
+2. **Memory**: at T=262144 the mHC state `[B, T, n=4, D=1536]` in bf16 is 6.4 GB
+   *before* attention activations. `chunked_forward` reduces the mHC peak from
+   O(T×n×D) to O(C×n×D), but it is not yet wired into the training loop.
+3. **Compute efficiency**: short-context steps are ~50× cheaper per token than
+   262K-context steps. Spending 90% of the token budget at 4K and 10% at long
+   context is the standard industry recipe (LLaMA-3, Mistral, DeepSeek-V3 all do this).
+
+---
+
+### Stage 0 — Base pretraining  `[ACTIVE]`
+
+| Field | Value |
+|-------|-------|
+| `seq_len` | 4096 |
+| `rope_scaling_type` | `"none"` |
+| `mhc_chunk_size` | N/A (standard `forward()`) |
+| `batch_size × grad_accum × gpus` | 1 × 8 × 2 = 16 samples → 65,536 tok/step |
+| Trigger to advance | `val_loss < 3.0`  AND  `step ≥ 3,000,000` (~20 B tokens) |
+
+**Nothing to change.** Current run (job 4486) covers this stage.
+
+---
+
+### Stage 1 — Medium context (32K)  `[NOT STARTED]`
+
+#### Trigger
+`val_loss < 3.0` on the 4K val set **and** at least 3 M optimizer steps completed.
+
+#### Config changes (`configs/train.yaml`)
+```yaml
+seq_len: 32768
+rope_scaling_type: yarn
+rope_scaling_factor: 8.0        # 32768 / 4096 = 8×
+max_position_embeddings: 4096   # base training length (reference for YaRN ramp)
+yarn_beta_fast: 32.0
+yarn_beta_slow: 1.0
+yarn_mscale: 0.1
+mhc_chunk_size: 4096            # NEW field (see code change below)
+batch_size: 1
+grad_accum: 4                   # effective = 1 × 4 × 2 = 8 samples × 32K = 262K tok/step
+warmup_steps: 200               # short re-warmup after ctx jump
+```
+
+#### Code changes required (agent: implement before launching Stage 1)
+
+**1. Add `mhc_chunk_size` to `TrainConfig`** in `train_end_to_end.py`:
+```python
+mhc_chunk_size: int = 0   # 0 = standard forward(); >0 = chunked_forward(chunk_size)
+```
+
+**2. Wire `chunked_forward` into the training step** — replace the inner micro-batch forward:
+```python
+# Before (standard):
+out = model(**batch)
+
+# After (chunked when mhc_chunk_size > 0):
+if cfg.mhc_chunk_size > 0:
+    # model is FSDP-wrapped Aether2BForCausalLM;
+    # call the underlying chunked forward via model.module.model.chunked_forward
+    # but we still need loss — route through Aether2BForCausalLM.forward() with
+    # precomputed hidden states, OR expose a chunked_forward on the top-level model.
+    out = model.module.chunked_causal_lm_forward(batch, mhc_chunk_size=cfg.mhc_chunk_size)
+else:
+    out = model(**batch)
+```
+The cleanest approach is to add `chunked_causal_lm_forward(batch, mhc_chunk_size)` to
+`Aether2BForCausalLM` that calls `self.model.chunked_forward(input_ids, mhc_chunk_size)`
+instead of `self.model(input_ids)`, then applies `lm_head` and loss as usual.
+
+**3. Update gradient checkpointing** — at 32K, gradient checkpointing should remain
+enabled to keep backward-pass activation memory bounded. No change needed if
+`gradient_checkpointing: true` is already set.
+
+**4. Ensure long-context documents are in the training memmap** — the current tokenized
+`train.bin` likely has documents truncated at 4096 tokens due to preprocessing. Before
+launching Stage 1, re-run preprocessing with `--max-seq-len 32768` or use a
+document-level memmap without truncation, then update `data_dir` in the config.
+
+#### Expected memory (2× L40S 48 GB)
+```
+mHC state   [1, 32768, 4, 1536] bf16 ≈  0.77 GB  (with chunk_size=4096: peak ≈ 0.096 GB)
+Attention    _PREFILL_CHUNK=256 inner loops inside HCA/CSA  ← already chunked
+Activations  ~8 GB with gradient checkpointing
+Total        ~9–12 GB per GPU  ✅ fits comfortably
+```
+
+#### Resume from checkpoint
+```bash
+# Edit configs/train.yaml: set seq_len, rope_scaling_type, mhc_chunk_size as above
+# Then restart training — it auto-resumes from checkpoint-latest.pt
+srun ... torchrun ... train_end_to_end.py --config configs/train.yaml
+```
+
+---
+
+### Stage 2 — Long context (131K)  `[NOT STARTED]`
+
+#### Trigger
+`val_loss < 2.5` on 32K val set **and** Stage 1 has run for ≥ 200K optimizer steps.
+
+#### Config changes
+```yaml
+seq_len: 131072
+rope_scaling_factor: 32.0       # 131072 / 4096 = 32×
+mhc_chunk_size: 4096
+batch_size: 1
+grad_accum: 1                   # 1 × 1 × 2 GPUs × 131K = 262K tok/step
+warmup_steps: 100
+```
+
+#### Memory estimate
+```
+mHC chunked peak   [1, 4096, 4, 1536] bf16 per chunk ≈ 0.096 GB  ✅
+Attention          HCA: O(T/M) compressed blocks = 1024 blocks at M=128  ✅
+                   CSA: top-k=256 blocks selected per token  ✅
+Activations        ~15 GB with gradient checkpointing
+Total              ~16–20 GB per GPU  ✅ fits on L40S 48 GB
+```
+
+#### Additional requirement
+At T=131072, the HCA inner prefill loop runs `ceil(T / _PREFILL_CHUNK) = 512` iterations.
+Python loop overhead becomes measurable (~2–3 s per layer). Consider:
+- Setting `use_tiled_prefill_cuda: true` in model config if CUDA kernels are built, OR
+- Increasing `_PREFILL_CHUNK` from 256 to 1024 (trades memory for fewer Python iterations).
+
+---
+
+### Stage 3 — Max context (262K)  `[NOT STARTED]`
+
+#### Trigger
+`val_loss < 2.3` on 131K val set **and** Stage 2 has run for ≥ 100K optimizer steps.
+
+#### Config changes
+```yaml
+seq_len: 262144
+rope_scaling_factor: 64.0       # 262144 / 4096 = 64×
+mhc_chunk_size: 4096
+batch_size: 1
+grad_accum: 1                   # 1 × 1 × 2 GPUs × 262K = 524K tok/step
+warmup_steps: 50
+```
+
+#### Memory estimate (2× L40S 48 GB)
+```
+mHC chunked peak   0.096 GB per chunk  ✅
+HCA compressed blocks  2048 blocks (M=128, T=262K)  ✅
+Attention activations  ~30 GB per GPU with gradient checkpointing
+Total  ~32–38 GB  ✅ fits, but tight — monitor with nvidia-smi
+```
+
+If OOM: add a 3rd or 4th GPU (`--gres=gpu:4`), or reduce `_PREFILL_CHUNK` to 128.
+
+#### CUDA kernel activation (recommended at this stage)
+Build the CUDA extension and set `use_tiled_prefill_cuda: true` in model config.
+This replaces the Python prefill loop with a fused kernel, cutting prefill time by ~3×:
+```bash
+python scripts/build_cuda_kernels.py --verbose
+# Then in configs/train.yaml (model_overrides section, to be added):
+# use_tiled_prefill_cuda: true
+```
+
+---
+
+### Stage summary
+
+| Stage | seq_len | rope_factor | tok/step | Trigger | Key code change |
+|-------|---------|------------|----------|---------|-----------------|
+| 0 (active) | 4,096 | 1× (none) | 65K | — | — |
+| 1 | 32,768 | 8× (YaRN) | 262K | val_loss < 3.0, step ≥ 3M | add `mhc_chunk_size` to trainer, `chunked_causal_lm_forward` on model |
+| 2 | 131,072 | 32× (YaRN) | 262K | val_loss < 2.5, step ≥ 200K post-stage1 | optionally increase `_PREFILL_CHUNK` |
+| 3 | 262,144 | 64× (YaRN) | 524K | val_loss < 2.3, step ≥ 100K post-stage2 | CUDA tiled prefill, 4× GPU if needed |
+
+All stages resume from `checkpoint-latest.pt` automatically (`auto_resume: true`).
+Only `configs/train.yaml` changes needed between stages.
+
+---
+
+## 11  Infrastructure / tooling
+
+- [ ] **Distributed checkpoint format (FSDP-safe sharding)**
+- [ ] **Weights-only or safetensors export**
+- [x] **Config-driven experiment management** — `configs/train.yaml`
+- [x] **W&B experiment tracking** — wired in `train_end_to_end.py`, project `aether-2b`
+- [ ] **Docker / container definition**
+- [ ] **CI/CD pipeline**
+
+---
+
 ## Priority order — next actions
 
 ```
 🔴 URGENT
 
-  1. Standard eval harness (HumanEval + GSM8K minimum via lm-evaluation-harness)
-  2. Monitor training convergence — target loss < 3.0 within first 50K steps
+  1. Monitor training — target val_loss < 3.0 (Stage 1 trigger, ~3 M steps)
+  2. Standard eval harness (HumanEval + GSM8K via lm-evaluation-harness)
   3. SFT training loop
 
-🟡 IMPORTANT
+🟡 IMPORTANT — prepare before Stage 1 ctx extension
 
-  4. Perplexity eval script for checkpoint comparison
-  5. Expand tiled-prefill CUDA path to masked/packed batches
-  6. Train and evaluate dense_2b vs MoE at same parameter budget
+  4. Add mhc_chunk_size to TrainConfig + chunked_causal_lm_forward on model
+     (see Section 10, Stage 1 — Code changes required)
+  5. Re-run preprocessing without 4K truncation so long docs reach train.bin
+  6. Perplexity eval script for post-hoc checkpoint comparison
 
 🟢 LATER
 
-  7. MQA output projection validation
-  8. safetensors export
-  9. Dockerfile + CI/CD
-  10. Full weight quantisation (FP8 / INT8)
+  7. Stages 2 and 3 ctx extension (131K → 262K) — after Stage 1 converges
+  8. CUDA tiled-prefill for training (needed at Stage 3, 262K)
+  9. MQA output projection validation
+  10. safetensors export
+  11. Dockerfile + CI/CD
+  12. Full weight quantisation (FP8 / INT8)
+```
 ```
