@@ -20,9 +20,49 @@ try:
 except ImportError:  # pragma: no cover
     _yaml = None  # type: ignore
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None  # type: ignore
+
 from aether_2b import Aether2BConfig, Aether2BForCausalLM
 from aether_2b.muon import Muon, split_muon_adamw_params
 from aether_pipeline.tokenizer import load_aether_tokenizer
+
+# ── pretty console helpers ────────────────────────────────────────────────────
+
+def _fmt_ppl(p: float) -> str:
+    if p >= 1e9:  return f"{p / 1e9:.2f}B"
+    if p >= 1e6:  return f"{p / 1e6:.2f}M"
+    if p >= 1e3:  return f"{p / 1e3:.1f}K"
+    return f"{p:.2f}"
+
+def _pp_header(hdr: dict) -> str:
+    sep = "─" * 68
+    name = f"{hdr.get('variant', '')}-{hdr.get('preset', '')}  ·  {hdr.get('total_params_B', '?')}B params"
+    info = f"{hdr.get('total_steps', 0):,} steps  ·  ckpt every {hdr.get('checkpoint_interval', '?')}"
+    return f"\n{sep}\n  {name}\n  {info}\n{sep}"
+
+def _pp_step(e: dict) -> str:
+    step, total = e["step"], e["total_steps"]
+    pct     = 100.0 * step / max(total, 1)
+    loss    = e.get("train_loss", float("nan"))
+    ppl     = e.get("train_ppl")
+    val     = e.get("val_loss")
+    vppl    = e.get("val_ppl")
+    lr      = e.get("lr_scale", 0)
+    elapsed = e.get("elapsed", "?")
+    eta     = e.get("eta", "")
+    tps     = e.get("tok_per_sec")
+
+    step_s  = f"[{step:>9,}/{total:,}  {pct:.3f}%]"
+    train_s = f"loss={loss:.4f}" + (f"  ppl={_fmt_ppl(ppl)}" if ppl is not None else "")
+    val_s   = (f"  │  val={val:.4f}" + (f"  ppl={_fmt_ppl(vppl)}" if vppl is not None else "")) if val is not None else ""
+    tps_s   = f"  │  {tps:.0f} tok/s" if tps is not None else ""
+    eta_s   = f"  eta {eta}" if eta and eta != "--:--:--" else ""
+    return f"{step_s}  {train_s}{val_s}  │  lr×{lr:.4f}{tps_s}  │  {elapsed}{eta_s}"
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class MemmapTokens(Dataset):
@@ -160,6 +200,9 @@ class TrainConfig:
     lr_min_ratio: float = 0.1
     # --- ETA reporting ---
     eta_window: int = 50             # rolling step window for ETA estimate
+    # --- Weights & Biases ---
+    wandb_project: Optional[str] = None   # set to enable W&B logging
+    wandb_run_name: Optional[str] = None  # run display name (auto-generated if None)
 
 
 def make_model_config(tokenizer_name: str, tokenizer_cache_dir: Optional[str], preset: str, variant: str = "moe") -> Aether2BConfig:
@@ -472,16 +515,26 @@ def _apply_lr_scale(optimizer: torch.optim.Optimizer, base_lr: float, scale: flo
 def _wrap_fsdp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
     """Wrap the model with FullyShardedDataParallel if available."""
     try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
         import functools
     except ImportError as exc:
         raise RuntimeError("FSDP requires PyTorch >= 1.12 with distributed support.") from exc
 
+    # bf16 throughout: halves param + all-gather memory vs fp32 default.
+    # Optimizer states (Muon momentum, AdamW exp_avg/sq) are created as
+    # torch.zeros_like(param) which will also be bf16; AdamW stability is
+    # fine for the small fraction of params it controls (norms/embeddings).
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
     policy = functools.partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
     return FSDP(
         model,
         auto_wrap_policy=policy,
+        mixed_precision=mp_policy,
         device_id=device,
         use_orig_params=True,  # required for Muon + AdamW hybrid
     )
@@ -545,6 +598,54 @@ def train(cfg: TrainConfig) -> None:
                 pass
 
     # ------------------------------------------------------------------
+    # Optimiser param split — must happen BEFORE FSDP wrapping.
+    # With use_orig_params=True, FSDP preserves the same Python Parameter
+    # objects, so the optimizer correctly tracks the FSDP-managed shards.
+    # Calling named_parameters() after nested FSDP wrap can miss inner
+    # modules in PyTorch 2.x, leading to an empty muon list.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Break weight tying and module sharing before FSDP wrapping.
+    #
+    # Two issues prevent FSDP from working with the as-built model:
+    #
+    # 1. lm_head.weight is tied to embed_tokens.weight (when
+    #    tie_word_embeddings=True).  FSDP shards them in different units
+    #    and produces corrupted views.  We clone to give lm_head its own
+    #    independent Parameter.
+    #
+    # 2. MTPHead stores a reference to the *same* lm_head nn.Module object
+    #    (mtp_head.lm_head IS model.lm_head).  A single nn.Module cannot
+    #    appear at two places in the module tree — FSDP wrapping will
+    #    assign it to one unit and leave the other with a stale view.
+    #    We give each MTPHead its own nn.Linear (fresh Parameter, same
+    #    initial weights).
+    # ------------------------------------------------------------------
+    if getattr(model.config, "tie_word_embeddings", False):
+        model.lm_head.weight = torch.nn.Parameter(
+            model.model.embed_tokens.weight.detach().clone()
+        )
+    _dev = next(model.parameters()).device
+    for mtp_head in model.mtp_heads:
+        if mtp_head.lm_head is model.lm_head:
+            fresh = torch.nn.Linear(
+                model_cfg.hidden_size, model_cfg.vocab_size, bias=False
+            ).to(_dev)
+            with torch.no_grad():
+                fresh.weight.copy_(model.lm_head.weight)
+            mtp_head.lm_head = fresh
+
+    muon_params, adamw_params = split_muon_adamw_params(model)
+    if not muon_params:
+        raise RuntimeError(
+            "split_muon_adamw_params returned an empty muon list — "
+            "check parameter naming in muon.py matches the model's attribute names."
+        )
+    # Record original 2-D shapes before FSDP replaces .data with 1-D shards.
+    # Passed to Muon so Newton-Schulz can reconstruct the matrix structure.
+    muon_param_shapes = {id(p): p.shape for p in muon_params}
+
+    # ------------------------------------------------------------------
     # FSDP wrapping
     # ------------------------------------------------------------------
     if cfg.fsdp:
@@ -555,6 +656,35 @@ def train(cfg: TrainConfig) -> None:
                 "Single-process FSDP is not supported."
             )
         model = _wrap_fsdp(model, torch.device(cfg.device))
+
+    # ------------------------------------------------------------------
+    # Activation checkpointing (applied AFTER FSDP wrapping using the
+    # FSDP-aware API so all-gather/reduce-scatter hooks fire correctly)
+    # ------------------------------------------------------------------
+    if cfg.gradient_checkpointing:
+        try:
+            import functools
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                apply_activation_checkpointing,
+                checkpoint_wrapper,
+                CheckpointImpl,
+            )
+            from aether_2b.modeling import AetherBlock
+            # NO_REENTRANT is required for FSDP1: reentrant checkpointing
+            # calls forward() inside no_grad() which breaks FSDP's
+            # all-gather hooks and causes parameter view corruptions.
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=functools.partial(
+                    checkpoint_wrapper,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                ),
+                check_fn=lambda m: isinstance(m, AetherBlock),
+            )
+        except Exception as _e:
+            # Fallback: plain enable_gradient_checkpointing if API unavailable
+            if hasattr(model, "enable_gradient_checkpointing"):
+                model.enable_gradient_checkpointing()
 
     # ------------------------------------------------------------------
     # Data loading (shard by rank for FSDP)
@@ -570,8 +700,10 @@ def train(cfg: TrainConfig) -> None:
     if len(train_set) == 0:
         raise ValueError("train.bin does not contain enough tokens for the configured sequence length.")
     val_path = os.path.join(cfg.data_dir, "val.bin")
+    # All ranks create val_loader — FSDP model.forward() inside evaluate() is a
+    # collective operation and requires all ranks to participate simultaneously.
     val_loader = None
-    if os.path.exists(val_path) and is_main:
+    if os.path.exists(val_path):
         if cfg.sequence_packing:
             val_set = PackedMemmapTokens(val_path, cfg.seq_len, eos_token_id=eos_id, strict=False)
         else:
@@ -580,11 +712,11 @@ def train(cfg: TrainConfig) -> None:
             val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
 
     # ------------------------------------------------------------------
-    # Optimisers (operate on the (possibly FSDP-wrapped) model)
+    # Optimisers (use the param lists built before FSDP wrapping)
     # ------------------------------------------------------------------
-    muon_params, adamw_params = split_muon_adamw_params(model)
     adamw = torch.optim.AdamW(adamw_params, lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=cfg.weight_decay)
-    muon = Muon(muon_params, lr=cfg.muon_lr, momentum=0.95, weight_decay=0.01, update_rescale=0.2)
+    muon = Muon(muon_params, lr=cfg.muon_lr, momentum=0.95, weight_decay=0.01, update_rescale=0.2,
+                param_shapes=muon_param_shapes)
 
     dtype_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -631,7 +763,7 @@ def train(cfg: TrainConfig) -> None:
     if is_main:
         from aether_2b.sizing import estimate_config_parameters
         total_params = estimate_config_parameters(model_cfg)
-        print(json.dumps({
+        hdr = {
             "status": "train_start",
             "variant": cfg.variant,
             "preset": cfg.preset,
@@ -639,7 +771,16 @@ def train(cfg: TrainConfig) -> None:
             "total_steps": total_steps,
             "checkpoint_interval": cfg.checkpoint_interval,
             "checkpoint_dir": cfg.output_dir,
-        }))
+        }
+        print(_pp_header(hdr))
+        if _wandb is not None and cfg.wandb_project:
+            _wandb.init(
+                project=cfg.wandb_project,
+                name=cfg.wandb_run_name or "aether-2b-dense",
+                config={**asdict(cfg), "total_params_B": hdr["total_params_B"]},
+                resume="allow",
+            )
+            _wandb.summary.update({"total_params_B": hdr["total_params_B"], "total_steps": total_steps})
 
     model.train()
     for next_step in range(step + 1, total_steps + 1):
@@ -678,13 +819,15 @@ def train(cfg: TrainConfig) -> None:
 
         step = next_step
 
+        # Evaluation: ALL ranks must call evaluate() together because model.forward()
+        # inside uses FSDP all-gathers which require every rank to participate.
+        if step == 1 or step % cfg.eval_interval == 0:
+            val_loss = evaluate(model, val_loader, cfg.device, dtype_ctx)
+        else:
+            val_loss = None
+
         if is_main:
             eta.tick(step, tokens_processed)
-
-            if step == 1 or step % cfg.eval_interval == 0:
-                val_loss = evaluate(model, val_loader, cfg.device, dtype_ctx)
-            else:
-                val_loss = None
 
             log_entry: Dict[str, object] = {
                 "step": step,
@@ -700,18 +843,30 @@ def train(cfg: TrainConfig) -> None:
             tps = eta.tokens_per_sec
             if tps is not None:
                 log_entry["tok_per_sec"] = round(tps, 1)
+            log_entry["train_ppl"] = round(math.exp(min(accum_loss, 20)), 4)
             if val_loss is not None:
                 log_entry["val_loss"] = round(val_loss, 6)
-            print(json.dumps(log_entry))
-
-        else:
-            val_loss = None
+                log_entry["val_ppl"] = round(math.exp(min(val_loss, 20)), 4)
+            print(_pp_step(log_entry))
+            if _wandb is not None and _wandb.run is not None:
+                _wandb.log(
+                    {k: v for k, v in log_entry.items() if isinstance(v, (int, float))},
+                    step=step,
+                )
 
         # ------------------------------------------------------------------
         # Checkpointing — only checkpoint-latest.pt and best.pth
         # ------------------------------------------------------------------
         ckpt_interval = cfg.checkpoint_interval
-        if is_main and (step % ckpt_interval == 0 or step == total_steps):
+        do_checkpoint = step % ckpt_interval == 0 or step == total_steps
+        # _fsdp_state_dict uses FULL_STATE_DICT with rank0_only=True which still
+        # requires ALL ranks to participate in the all-gather; call it outside is_main.
+        if do_checkpoint:
+            model_sd = _fsdp_state_dict(model) if _is_fsdp_wrapped(model) else model.state_dict()
+        else:
+            model_sd = None
+
+        if is_main and do_checkpoint:
             metric_name = "val_loss" if val_loss is not None else "train_loss"
             metric_value = val_loss if val_loss is not None else accum_loss
             save_best = best_metric is None or metric_value < best_metric
@@ -720,7 +875,6 @@ def train(cfg: TrainConfig) -> None:
                 best_metric_name = metric_name
                 best_step = step
 
-            model_sd = _fsdp_state_dict(model) if _is_fsdp_wrapped(model) else model.state_dict()
             payload = {
                 "step": step,
                 "epoch": epoch,
@@ -742,18 +896,20 @@ def train(cfg: TrainConfig) -> None:
             os.makedirs(cfg.output_dir, exist_ok=True)
             latest_path = os.path.join(cfg.output_dir, "checkpoint-latest.pt")
             torch.save(payload, latest_path)
-            print(json.dumps({"saved_checkpoint": latest_path, "step": step}))
+            print(f"  ✓  checkpoint  →  {latest_path}  [step {step:,}]")
 
             if save_best:
                 best_path = os.path.join(cfg.output_dir, "best.pth")
                 torch.save(payload, best_path)
-                print(json.dumps({"saved_best": best_path, "step": step,
-                                  "best_metric": metric_name, "best_value": round(metric_value, 6)}))
+                print(f"  ★  new best  {metric_name}={round(metric_value, 4)}  →  {best_path}  [step {step:,}]")
 
         # Barrier: all ranks wait before the next step so rank-0 state dict
         # gather above doesn't race with the next FSDP forward.
         if is_distributed:
             dist.barrier()
+
+    if is_main and _wandb is not None and _wandb.run is not None:
+        _wandb.finish()
 
 
 def _load_yaml_config(path: str) -> Dict[str, object]:
@@ -798,6 +954,10 @@ def main() -> None:
     parser.add_argument("--lr-min-ratio", type=float, default=None)
     parser.add_argument("--eta-window", type=int, default=None,
                         help="Rolling step window for ETA estimate (default: 50).")
+    parser.add_argument("--wandb-project", default=None,
+                        help="W&B project name. Omit to disable W&B logging.")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="W&B run display name (auto-generated if omitted).")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -856,6 +1016,8 @@ def main() -> None:
         warmup_steps=_get(args.warmup_steps, "warmup_steps", _default_cfg.warmup_steps),
         lr_min_ratio=_get(args.lr_min_ratio, "lr_min_ratio", _default_cfg.lr_min_ratio),
         eta_window=_get(args.eta_window, "eta_window", _default_cfg.eta_window),
+        wandb_project=_get(args.wandb_project, "wandb_project", _default_cfg.wandb_project),
+        wandb_run_name=_get(args.wandb_run_name, "wandb_run_name", _default_cfg.wandb_run_name),
     ))
 
 

@@ -281,8 +281,9 @@ class HCAAttention(CompressedAttentionBase):
         z = self.z_proj(h).view(h.size(0), full, m, -1) + self.bias.view(1, 1, m, -1)
         weights = torch.softmax(z.float(), dim=2).to(c.dtype)
         comp = (weights * c).sum(dim=2)
+        # Bug 3 fix: pass config= so YaRN scaling is applied consistently with queries.
         positions = (torch.arange(full, device=h.device) * m + (m - 1)).long()
-        comp = apply_rope(comp, positions, self.config.rope_dim, self.config.rope_theta)
+        comp = apply_rope(comp, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return self.kv_norm(comp), positions
 
     # Chunk size for the T-dimension during prefill.  Keeps peak memory bounded
@@ -472,7 +473,11 @@ class CSAAttention(CompressedAttentionBase):
             self.bias_a,
             self.bias_b,
         )
-        positions = torch.arange(comp.size(1), device=comp.device) * self.config.csa_compression
+        # Bug 1 fix: use end-of-block positions (i*M + M-1) matching HCA convention.
+        # At the first query that causal-sees block i (token t = (i+1)*M), the
+        # relative RoPE distance is 1 (block just completed) instead of M (start-of-block).
+        m = self.config.csa_compression
+        positions = torch.arange(comp.size(1), device=comp.device) * m + (m - 1)
         comp = apply_rope(comp, positions, self.config.rope_dim, self.config.rope_theta, config=self.config)
         return self.kv_norm(comp)
 
@@ -514,7 +519,8 @@ class CSAAttention(CompressedAttentionBase):
             g = min(nb, t // M)
             if g > 0 and K_cfg > 0:
                 s = torch.einsum("bic,bsc->bis", index_q[:, t], index_keys[:, :g])
-                s = (F.relu(s) * index_w[:, t].unsqueeze(-1)).sum(dim=1)  # [B, g]
+                # Bug 2 fix: softplus to ensure non-negative head weights.
+                s = (F.relu(s) * F.softplus(index_w[:, t]).unsqueeze(-1)).sum(dim=1)  # [B, g]
                 k_eff = min(K_cfg, g)
                 topk = torch.topk(s, k=k_eff, dim=-1).indices  # [B, k_eff]
                 sel = comp[b_index[:, None], topk]  # [B, k_eff, D]
@@ -597,9 +603,12 @@ class CSAAttention(CompressedAttentionBase):
             # ── top-k selection for this chunk ────────────────────────────
             if K > 0:
                 # Score: [B, C, IH, nb] → reduce IH → [B, C, nb]
+                # Bug 2 fix: apply softplus so head weights are strictly positive;
+                # a negative weight would flip the sign of a relevant block's score,
+                # causing top-k to retrieve irrelevant blocks.
                 s = torch.einsum("btic,bsc->btis",
                                  index_q[:, t_start:t_end], index_keys)   # [B,C,IH,nb]
-                s = (F.relu(s) * index_w[:, t_start:t_end].unsqueeze(-1)).sum(dim=2)  # [B,C,nb]
+                s = (F.relu(s) * F.softplus(index_w[:, t_start:t_end]).unsqueeze(-1)).sum(dim=2)  # [B,C,nb]
                 causal_g_ch = block_idx.view(1, 1, nb) < (t_ch // M).view(1, C, 1)
                 bm_ch = causal_g_ch & valid_g                             # [B, C, nb]
                 s = s.masked_fill(~bm_ch, float("-inf"))
@@ -650,9 +659,9 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         self.s_pre = nn.Parameter(torch.zeros(n))
         self.s_res = nn.Parameter(torch.eye(n))
         self.s_post = nn.Parameter(torch.zeros(n))
-        self.alpha_pre = nn.Parameter(torch.tensor(1e-3))
-        self.alpha_res = nn.Parameter(torch.tensor(1e-3))
-        self.alpha_post = nn.Parameter(torch.tensor(1e-3))
+        self.alpha_pre = nn.Parameter(torch.tensor([1e-3]))
+        self.alpha_res = nn.Parameter(torch.tensor([1e-3]))
+        self.alpha_post = nn.Parameter(torch.tensor([1e-3]))
 
     def _sinkhorn(self, raw: torch.Tensor) -> torch.Tensor:
         m = torch.exp(raw.clamp(min=-20.0, max=20.0))
@@ -675,7 +684,10 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         a = torch.sigmoid(a_raw)
         b = self._sinkhorn(b_raw)
         c = 2.0 * torch.sigmoid(c_raw)
-        x = torch.einsum("btn,btnd->btd", a, state)
+        # Use the normalized state for sublayer input to prevent quadratic FFN blow-up.
+        # The residual path (mixed = b @ state) still uses the unnormalized state.
+        norm_state = flat.view(bsz, seq_len, n, d)
+        x = torch.einsum("btn,btnd->btd", a, norm_state)
         if isinstance(self.sublayer, AetherMoE):
             y, balance_loss = self.sublayer(x, token_ids=token_ids, token_mask=attention_mask)
         else:
@@ -737,7 +749,9 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             flat_c = self.norm(state_c.reshape(bsz, t_end - t_start, n * d))
             a_raw_c = self.alpha_pre * self.w_pre(flat_c) + self.s_pre
             a_c = torch.sigmoid(a_raw_c)                   # [B, C, n]
-            x_c = torch.einsum("btn,btnd->btd", a_c, state_c)  # [B, C, D]
+            # Use normalized state for sublayer input (same fix as in forward()).
+            norm_state_c = flat_c.view(bsz, t_end - t_start, n, d)
+            x_c = torch.einsum("btn,btnd->btd", a_c, norm_state_c)  # [B, C, D]
             x_parts.append(x_c)
             # flat_c, a_raw_c, a_c freed at end of loop iteration
 
@@ -877,6 +891,11 @@ class AetherBlock(nn.Module):
         return state, balance_loss if balance_loss is not None else state.new_tensor(0.0)
 
 
+def _checkpoint_layer(layer, state, input_ids, attention_mask):
+    """Thin wrapper so torch.utils.checkpoint can call a layer with keyword args."""
+    return layer(state, token_ids=input_ids, attention_mask=attention_mask)
+
+
 class Aether2BModel(nn.Module):
     def __init__(self, config: Aether2BConfig):
         super().__init__()
@@ -885,7 +904,11 @@ class Aether2BModel(nn.Module):
         self.layers = nn.ModuleList(AetherBlock(config, i) for i in range(config.num_hidden_layers))
         self.final_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post = nn.Parameter(torch.ones(config.mhc_expansion) / config.mhc_expansion)
+        self.gradient_checkpointing = False
         self.apply(self._init_weights)
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -992,6 +1015,9 @@ class Aether2BForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.mtp_heads = nn.ModuleList(MTPHead(config, self.lm_head) for _ in range(config.mtp_depth))
+
+    def enable_gradient_checkpointing(self):
+        self.model.enable_gradient_checkpointing()
 
     def forward(
         self,

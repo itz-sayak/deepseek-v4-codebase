@@ -6,13 +6,25 @@ Aether 2B is a compact PyTorch implementation of a 2B-parameter causal language 
 
 ## Architecture
 
-The model uses a 28-layer transformer with a hybrid attention schedule. The first two layers use standard HCA (Hybrid Compression Attention), after which every layer alternates between HCA and CSA (Compressed Sink Attention). HCA compresses the key-value sequence at the layer boundary using a learned linear projection, while CSA maintains a fixed sink window plus a top-k sparse compressed buffer selected by the CSA lightning indexer. Both branches share partial RoPE embeddings and a unified sliding-window KV branch with attention sink logits.
+The model uses a 28-layer transformer with a hybrid attention schedule. The first two layers use HCA (Hierarchical Compression Attention), after which every layer alternates between HCA and CSA (Compressed Sink Attention).
 
-Each layer's feedforward network is wrapped in a Manifold-Constrained Hyper-Connection (mHC) module. The mHC module maintains a learned A/B/C affinity map and applies a Sinkhorn projection to B at each step, which enforces a doubly-stochastic mixing constraint over the residual stream. The feedforward block itself is an AetherMoE mixture: a small number of shared experts are always activated, while a larger pool of routed experts compete via a `sqrt(softplus(.))` affinity score. The first layer uses hash routing instead of a learned router to break symmetry early in training. A sequence-level balance loss penalises load imbalance across the routed pool.
+**HCA** compresses the context into fixed-size blocks by applying learned per-position-within-block attention weights (a separate `z_proj` and learned `bias[m, D]`) over each group of `hca_compression=128` consecutive tokens, producing one compressed key/value per block. Each compressed block is RoPE-encoded at the **end of its block** (position `i*M + M - 1`), so that at the first causal step that observes it the relative RoPE distance is exactly 1. Queries attend to all causally-valid compressed blocks plus a local sliding window of `sliding_window=128` tokens.
 
-A pure-dense variant is also supported. Setting `dense_ffn_intermediate_size=14336` in the config replaces all MoE routing with a single SwiGLU of that width, eliminating the router linear, the expert dispatch, and the balance loss entirely. Both variants land at approximately 2.1 B total parameters with 28 layers.
+**CSA** uses overlapping two-stream compression (`csa_compression=4` tokens per block) with a cross-block mixing. A lightweight indexer — multi-head dot-product over separate index projections with `F.softplus`-constrained per-head importance weights — scores all compressed blocks and selects the top-`csa_top_k=256` most relevant ones per query token. The selected compressed blocks and the sliding window are jointly attended with a learned per-head sink logit. Compressed block positions are RoPE-encoded at end-of-block (matching HCA) so causality and relative-distance semantics are consistent across both attention types.
 
-Positional encoding uses RoPE with YaRN scaling. The `get_rope_freqs(seq_len, config)` helper is shared between training forward and the serving decode loop so that the frequency schedule is always consistent. The YaRN logit correction (`rope_attention_scale`) is applied inside HCA and CSA attention and has been validated at context lengths up to 262 K tokens. The model also carries a depth-1 MTP (Multi-Token Prediction) auxiliary head and uses the Muon optimizer with the paper's 8+2 hybrid Newton-Schulz coefficients.
+Each layer's residual connections are handled by a **Manifold-Constrained Hyper-Connection (mHC)** module. The mHC maintains an expanded state of shape `[B, T, n=4, D]` — four parallel residual streams per token. At each layer it computes:
+
+- `a ∈ [0,1]^n` (sigmoid-gated pre-mix): weighted combination of the 4 normalized streams → sublayer input `x`
+- `b ∈ ℝ^{n×n}` (Sinkhorn-projected, doubly stochastic): mixes the 4 unnormalized streams for the residual path
+- `c ∈ [0,2]^n` (2·sigmoid post-mix scalar): scales the sublayer output before adding back
+
+Initialization: `b = I_n` (identity → standard residual at t=0), `c = 1` (unit scale), `a` from zeros (equal stream weighting). The Sinkhorn projection (`mhc_sinkhorn_iters=20`) enforces row-sum=1 and col-sum=1 on `b`, preserving total residual energy across streams.
+
+The feedforward block is an AetherMoE mixture: a small number of shared experts are always activated, while a larger pool of routed experts compete via a `sqrt(softplus(.))` affinity score. The first `hash_routed_layers=3` layers use hash routing to break symmetry early. A sequence-level balance loss penalises load imbalance.
+
+A pure-dense variant replaces all MoE routing with a single SwiGLU of width `dense_ffn_intermediate_size=14336`, eliminating routing overhead entirely. Both variants land at ~2.13 B total parameters.
+
+Positional encoding uses RoPE with optional YaRN scaling. The `get_rope_freqs(seq_len, config)` helper is shared between training and serving. The YaRN logit correction (`rope_attention_scale`) is applied inside HCA and CSA attention. The model carries a depth-1 MTP (Multi-Token Prediction) auxiliary head and uses the Muon optimizer with 8+2 hybrid Newton-Schulz coefficients.
 
 ---
 
@@ -74,7 +86,20 @@ The custom CUDA extension in `aether_kernels/` provides a fused sparse sink-atte
 
 ## Training
 
-`train_end_to_end.py` provides a single-script pretraining loop with FSDP multi-GPU support, linear-warmup cosine-decay LR schedule, gradient checkpointing, sequence packing, and Muon + AdamW dual-optimizer split. The script accepts a YAML config file via `--config configs/train.yaml` and supports a `variant` field to switch between the MoE and dense architecture without changing any other hyperparameters. An `ETATracker` provides rolling-window tok/s and hh:mm:ss ETA estimates in the JSON training log. Checkpointing writes only two files per interval: `checkpoint-latest.pt` (always overwritten) and `best.pth` (overwritten only when validation loss improves).
+`train_end_to_end.py` provides a single-script pretraining loop with FSDP multi-GPU support, linear-warmup cosine-decay LR schedule, gradient checkpointing, sequence packing, and Muon + AdamW dual-optimizer split. The script accepts a YAML config via `--config configs/train.yaml`.
+
+**Active training run** (May 2026): dense-2b variant, 2× L40S 48 GB GPUs (SLURM job), `seq_len=4096`, `batch_size=1`, `grad_accum=8`, effective batch = 16 sequences ≈ 65K tokens. Training loss at step 1: **15.63** (finite, no NaN). Logged to W&B project `aether-2b`.
+
+Console output format (per step):
+```
+────────────────────────────────────────────────────────────────────
+  dense-2b  ·  2.232B params
+  31,378,874 steps  ·  ckpt every 1000
+────────────────────────────────────────────────────────────────────
+[        1/31,378,874  0.000%]  loss=15.6344  ppl=6.17M  │  val=15.6318  ppl=6.15M  │  lr×0.0000  │  00:01:33
+```
+
+An `ETATracker` provides rolling-window tok/s and hh:mm:ss ETA estimates. Checkpointing writes `checkpoint-latest.pt` (always overwritten) and `best.pth` (overwritten only when validation loss improves).
 
 ---
 

@@ -6,6 +6,87 @@ This repository now contains a self-contained training pipeline for the Aether 2
 
 The external reference repo was cloned separately outside this workspace-facing package layout.
 
+---
+
+## May 2026 Sprint: Architecture Math Audit, NaN Fix, Training Launch
+
+### 1. NaN Loss Fix — ManifoldConstrainedHyperConnection Sublayer Input
+
+**Root cause**: In `ManifoldConstrainedHyperConnection.forward()`, the sublayer input was computed as:
+```python
+x = torch.einsum("btn,btnd->btd", a, state)   # BUG: state is unnormalized
+```
+`state` is the raw mHC expanded state `[B, T, n, D]` that accumulates across 28 layers. At initialization, `state ≈ embed(token) ≈ N(0, 0.02)` per element. After each layer's `b @ state + c * y` residual update, the norm of `state` grows roughly proportional to the FFN's weight norms. By layer 8, `‖state‖` had grown to O(10²¹), causing the SwiGLU gate and up projections to overflow to NaN.
+
+**Fix**: Use `norm_state = flat.view(bsz, seq_len, n, d)` (where `flat` is already RMSNorm-normalized) as the sublayer input:
+```python
+flat = self.norm(state.reshape(bsz, seq_len, n * d))
+norm_state = flat.view(bsz, seq_len, n, d)
+x = torch.einsum("btn,btnd->btd", a, norm_state)   # FIXED
+```
+The residual path `mixed = b @ state` intentionally continues to use unnormalized `state` (the Sinkhorn-constrained b preserves energy). Applied in both `forward()` and `chunked_forward()`.
+
+**Validation**: CPU forward pass (float32 and bfloat16) yields loss = **15.63** at step 1. GPU training on 2× L40S 48 GB: loss finite from step 1.
+
+---
+
+### 2. CSA Math Fix — Block Positions (Bug 1)
+
+**File**: `CSAAttention._compress_main`
+
+**Problem**: CSA compressed blocks were assigned start-of-block RoPE positions (`i*M`). HCA correctly uses end-of-block (`i*M + M-1`).
+
+**Why end-of-block is correct**: The causal mask exposes block `i` to query `t` only when `t ≥ (i+1)*M`. At that moment, the relative RoPE distance should be:
+
+$$\Delta = t - p_i = (i+1)M - (iM + M-1) = 1 \quad\text{(end-of-block, correct)}$$
+$$\Delta = t - p_i = (i+1)M - iM = M \quad\text{(start-of-block, was wrong by } M-1=3\text{)}$$
+
+The block appears semantically "1 step in the past" with the correct encoding.
+
+**Fix**: `positions = torch.arange(comp.size(1)) * m + (m - 1)` (matching HCA).
+
+---
+
+### 3. CSA Math Fix — Indexer Weights (Bug 2)
+
+**File**: `CSAAttention.forward` and `_forward_tiled_prefill`
+
+**Problem**: The top-k block selection score used raw `nn.Linear` output (unconstrained sign) as head importance weights:
+```python
+s = (F.relu(s) * index_w.unsqueeze(-1)).sum(dim=2)
+```
+After `F.relu`, per-head similarities are ≥ 0. Negative `index_w` values flip the sign, causing top-k to retrieve blocks with the most negative scores — the **least** relevant blocks.
+
+**Fix**: `F.softplus(index_w)` ensures strictly positive weights:
+```python
+s = (F.relu(s) * F.softplus(index_w).unsqueeze(-1)).sum(dim=2)
+```
+
+---
+
+### 4. HCA apply_rope Fix — Missing config= Argument (Bug 3)
+
+**File**: `HCAAttention._compress`
+
+**Problem**: `apply_rope` called without `config=self.config` skips YaRN frequency scaling on compressed HCA keys while queries receive YaRN scaling — positional frequency mismatch at inference in long-context mode.
+
+**Fix**: Added `config=self.config` keyword argument. No impact during pretraining (currently `rope_scaling_type="none"`); prevents mismatch at long-context inference.
+
+---
+
+### 5. Training Setup — Dense-2B Pretraining (May 2026)
+
+**Hardware**: SLURM `gpu1` partition, 2× L40S 48 GB GPUs (node1).  
+**Model**: `dense_2b()` config — 28 layers, hidden=1536, 16 heads, SwiGLU width=14336, ~2.232 B params.  
+**FSDP**: `use_orig_params=True`, `size_based_auto_wrap_policy`, `MixedPrecision(bf16)`.  
+**Optimizers**: Muon (2D weights) + AdamW (embeddings, norms, 1D).  
+**Data**: `seq_len=4096`, `batch_size=1`, `grad_accum=8` → 65,536 tokens/step.  
+**Total steps**: 31,378,874. **W&B**: project `aether-2b`.
+
+Step 1 loss: **15.6344** | ppl: **6.17M** | val loss: **15.6318** | val ppl: **6.15M**
+
+---
+
 ## Dataset Sources
 
 Exact Hugging Face source identities were taken from the external reference downloader.

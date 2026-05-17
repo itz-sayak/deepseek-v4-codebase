@@ -18,20 +18,33 @@ to **Aether 2B**; packages renamed to `aether_2b`, `aether_pipeline`,
 `CUDA_HOME/bin` and standard system paths so the 4 CUDA tests pass without
 manually adding `/usr/local/cuda/bin` to `PATH`.
 
-**April 2026 additions (this sprint)**:
-- **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache with
-  Walsh-Hadamard + Lloyd-Max quantisation. Validated by needle-in-haystack eval:
-  8-bit KL ≈ 0 (near-lossless), 4-bit KL < 0.001, 100% top-1 match at all tested
-  context lengths (64–256 tokens on CPU tiny model; GPU YaRN runs at 2K–262K also
-  pass with top-1 match 100% and KL in [4e-6, 8e-6]).
-- **Prefill OOM fix** — `chunked_fast_prefill(mhc_chunk_size=4096)` reduces mHC
-  peak from O(T×n×D) to O(C×n×D) + O(T×D). At T=262K, n=4, D=1536: 25.2 GB → 1.2 GB.
-- **YaRN RoPE scaling** — config-driven long-context positional encoding. Validated
-  at all context lengths up to 262K; top-1 match 100% with YaRN enabled.
-- **Speculative decoding** — `SpeculativeDecoder` with draft-model acceptance/rejection
-  (Chen et al., 2023). **Measured α = 0.97 (tiny draft, K=3)** — acceptance rate is
-  excellent but net decode throughput is ~15% slower than baseline due to draft
-  model overhead. See benchmark results and open item below.
+**May 2026 additions (this sprint)**:
+- **NaN loss fix** — `ManifoldConstrainedHyperConnection` was passing raw (unnormalized)
+  state to the sublayer, causing quadratic FFN blow-up (`O(0.02) → O(10²¹)` in 8
+  layers). Fixed by using `norm_state = flat.view(bsz, seq_len, n, d)` for the
+  sublayer input `x` while keeping the residual path on the unnormalized state.
+  Training loss at step 1: **15.63** (finite). Applied in both `forward()` and
+  `chunked_forward()`.
+- **CSA math fixes** — Two mathematical bugs corrected in `CSAAttention`:
+  1. **Block positions**: `_compress_main` now assigns end-of-block positions
+     (`i*M + M-1`) matching HCA convention. Previously used start-of-block (`i*M`),
+     causing relative RoPE distances to be off by `M-1=3` positions.
+  2. **Indexer weights**: `F.softplus` applied to `index_w` before top-k scoring.
+     Previously unconstrained (could be negative), causing top-k to potentially
+     retrieve irrelevant blocks.
+- **HCA apply_rope fix** — `HCAAttention._compress` now passes `config=self.config`
+  to `apply_rope`, ensuring YaRN scaling is applied consistently to compressed keys.
+- **Aesthetic console logging** — Training output replaced from raw JSON to
+  human-readable format with banner, progress %, loss, ppl, tok/s, ETA.
+- **Perplexity logging** — `train_ppl` and `val_ppl` added to per-step log and W&B.
+- **Active pretraining** — SLURM job running on 2× L40S 48 GB, dense-2b variant,
+  finite loss from step 1, W&B project `aether-2b`.
+
+**April 2026 additions (previous sprint)**:
+- **TurboQuant / PolarQuant** — 8-bit and 4-bit compressed KV cache.
+- **Prefill OOM fix** — `chunked_fast_prefill(mhc_chunk_size=4096)`.
+- **YaRN RoPE scaling** — config-driven long-context positional encoding.
+- **Speculative decoding** — `SpeculativeDecoder` with α = 0.97 measured.
 
 ### Measured throughput (CPU / fp32 / batch=1 / bench-runs=3, tiny model)
 
@@ -178,51 +191,62 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 
 - [x] **Speculative decoding — self-spec draft tuning**
   Full depth × temperature × quant grid swept on 2× RTX 4090 (262K context).
-  Dequant-cache + fast-sync-path optimisations implemented in `serving.py` /
-  `speculative.py`.  Best operating point locked in `spec_defaults.py`:
+  Best operating point locked in `spec_defaults.py`:
   depth=16, temp=0.6, no draft quant → **6.377 tok/s, 0.861×** at 262K.
-  `DecodeScheduler.from_self_spec_defaults(engine)` factory wires this config
-  into the continuous-batching pipeline in one call.
 
-- [x] **Dense configuration variant — `DeepSeekV4Pro2BConfig.dense_2b()`**
+- [x] **Dense configuration variant**
   `dense_ffn_intermediate_size=14336` replaces all MoE routing with a single
-  SwiGLU per layer.  Total parameters: **1.990 B** (matches MoE class).  No
-  router, no expert dispatch, no balance loss.  `estimate_config_parameters`
-  handles both variants.  `DeepSeekMoE` executes a dense fast-path when the
-  field is set.  See `aether_2b/configuration.py`.
+  SwiGLU per layer. Total parameters: ~2.135 B.
+
+- [x] **CSA math fix — block positions (Bug 1, May 2026)**
+  `_compress_main` previously assigned start-of-block positions (`i*M`).
+  Fixed to end-of-block (`i*M + M-1`) matching HCA convention.
+  Impact: relative RoPE distances were off by `M-1=3` for all CSA layers;
+  the first causal observer of block i now correctly encodes relative distance 1.
+
+- [x] **CSA math fix — indexer weights (Bug 2, May 2026)**
+  `index_w = self.index_weight(hidden_states)` (unconstrained linear) was
+  multiplied directly against per-head similarities. Negative weights would flip
+  relevant blocks to negative scores, causing top-k to retrieve wrong blocks.
+  Fixed: `F.softplus(index_w)` ensures strictly positive head importance weights.
+
+- [x] **HCA apply_rope fix — missing config (Bug 3, May 2026)**
+  `HCAAttention._compress` now passes `config=self.config` to `apply_rope` so
+  YaRN scaling is applied consistently to compressed block positions.
+
+- [x] **NaN loss fix — mHC sublayer input normalization (May 2026)**
+  `ManifoldConstrainedHyperConnection` now uses `norm_state` (RMSNorm-normalized)
+  as sublayer input instead of raw `state`. Raw state grew O(0.02) → O(10²¹)
+  in 8 layers via quadratic FFN blow-up. Loss at step 1 is now 15.63 (finite).
 
 - [ ] **Multi-query and grouped-query attention variants**
-  Full MHA used for grouped output projection. Paper's production config uses MQA
-  compression. Config supports the shape parameters but non-default settings
-  are unvalidated.
+  Full MHA used for grouped output projection. Non-default settings unvalidated.
 
 - [x] **RoPE scaling for context lengths beyond training length**
   YaRN and linear scaling implemented and validated up to 262K tokens.
 
 ---
 
-## 8  Infrastructure / tooling
+## 8  Training — active run
+
+- [x] **FSDP multi-GPU training** — 2× L40S 48 GB (SLURM), torchrun + FSDP1
+- [x] **Finite loss from step 1** — 15.63 (dense-2b, bf16, seq_len=4096)
+- [x] **Perplexity logging** — `train_ppl` and `val_ppl` in per-step log and W&B
+- [x] **Aesthetic console output** — banner + `[step/total %]` lines (not JSON)
+- [ ] **First checkpoint at step 1000** — in progress
+- [ ] **Convergence milestone: loss < 3.0** — not yet reached
+- [ ] **Post-training: SFT and DPO** — data downloaded, no trainer yet
+
+---
+
+## 9  Infrastructure / tooling
 
 - [ ] **Distributed checkpoint format (FSDP-safe sharding)**
-  Monolithic `.pt` files via `torch.save`. Does not scale beyond current model size.
-
 - [ ] **Weights-only or safetensors export**
-  No script to export as `safetensors` or HuggingFace-compatible format.
-
-- [x] **Config-driven experiment management**
-  `configs/train.yaml` exposes all hyperparameters. `--config` CLI arg merges YAML
-  with per-run overrides. `variant: moe|dense` switches architecture. ETATracker
-  provides rolling tok/s and hh:mm:ss ETA in the training log.
-
-- [ ] **W&B / MLflow experiment tracking**
-  Training log is JSON lines to stdout. No integration with experiment tracking
-  platforms.
-
+- [x] **Config-driven experiment management** — `configs/train.yaml`
+- [x] **W&B experiment tracking** — wired in `train_end_to_end.py`, project `aether-2b`
 - [ ] **Docker / container definition**
-  No `Dockerfile`. CUDA build requires manually maintained `deepfill` conda env.
-
 - [ ] **CI/CD pipeline**
-  No GitHub Actions. `pytest -q` and smoke pipeline run manually only.
 
 ---
 
@@ -232,20 +256,19 @@ Raw JSON results in `artifacts/benchmark_speculative_k3.json`.
 🔴 URGENT
 
   1. Standard eval harness (HumanEval + GSM8K minimum via lm-evaluation-harness)
-  2. SFT training loop
+  2. Monitor training convergence — target loss < 3.0 within first 50K steps
+  3. SFT training loop
 
 🟡 IMPORTANT
 
-  3. Perplexity eval script
-  4. Expand tiled-prefill CUDA path coverage to masked/packed training batches
-  5. Train and evaluate the dense_2b variant to compare quality vs MoE at same
-     parameter budget
+  4. Perplexity eval script for checkpoint comparison
+  5. Expand tiled-prefill CUDA path to masked/packed batches
+  6. Train and evaluate dense_2b vs MoE at same parameter budget
 
 🟢 LATER
 
-  6. MQA output projection validation
-  7. safetensors export
-  8. Dockerfile + CI/CD
-  9. YAML config + experiment tracking
-  10. Full weight quantisation (FP8 / INT8 for linear projections)
+  7. MQA output projection validation
+  8. safetensors export
+  9. Dockerfile + CI/CD
+  10. Full weight quantisation (FP8 / INT8)
 ```
